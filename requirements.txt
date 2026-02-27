@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+matplotlib
+torch
+gymnasium[all]
+stable-baselines3[extra]
+vgamepad
+pyaccsharedmemory
