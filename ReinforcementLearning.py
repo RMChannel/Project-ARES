@@ -7,9 +7,13 @@ from pyaccsharedmemory import accSharedMemory
 import vgamepad as vg
 
 # ========== COSTANTI ==========
+
+
 MAX_STEER_DEG = 540.0
 TARGET_SPEED_KMH = 150.0  # Velocità che l'IA proverà a mantenere/raggiungere
 REFRESH_RATE = 0.05  # 20 Hz (50ms per step)
+
+
 
 
 class AssettoCorsaEnv(gym.Env):
@@ -20,6 +24,8 @@ class AssettoCorsaEnv(gym.Env):
 
         # Connessione ad AC
         self.asm = self._connect_shared_memory()
+
+
 
         # Controller virtuale Xbox 360 (Verrà visto da AC come un joypad)
         self.gamepad = vg.VX360Gamepad()
@@ -101,6 +107,9 @@ class AssettoCorsaEnv(gym.Env):
 
         speed_kmh = getattr(physics, "speed_kmh", 0.0)
         is_off_track = getattr(physics, "numberOfTyresOut", 0) >= 3  # Penalità se esce di pista
+        rpm = getattr(physics,"rpm", 0.0)
+        gear = getattr(physics,"gear",0)
+
 
         reward = 0.0
         terminated = False
@@ -115,6 +124,14 @@ class AssettoCorsaEnv(gym.Env):
 
         if speed_kmh < 2.0:
             reward -= 1.0  # Penalità per lo stallo
+
+        if rpm < 1000:
+            reward -= 10.0
+
+
+        #Facciamo in modo che aumenti la marcia
+        if gear < 2:
+            reward -= 5.0
 
         return reward, terminated
 
