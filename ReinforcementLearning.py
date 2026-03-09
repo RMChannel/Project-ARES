@@ -176,5 +176,5 @@ if __name__ == "__main__":
     finally:
         # Salva il modello addestrato
         model.save("ppo_assetto_corsa")
-        print("[+] Modello salvato come 'ppo_assetto_corsa.zip'.")
+        print("[+] Modello salvato come 'ppo'_assetto_corsa.zip'.")
         env.close()
