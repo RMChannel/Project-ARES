@@ -1,3 +1,4 @@
+import os
 import time
 import numpy as np
 import gymnasium as gym
@@ -13,6 +14,8 @@ import pyautogui
 MAX_STEER_DEG = 540.0
 TARGET_SPEED_KMH = 150.0  # Velocità che l'IA proverà a mantenere/raggiungere
 REFRESH_RATE = 0.05  # 20 Hz (50ms per step)
+MODEL_PATH = "ppo_assetto_corsa"
+
 
 
 
@@ -179,9 +182,13 @@ if __name__ == "__main__":
     print("[+] Inizializzazione Ambiente Assetto Corsa...")
     env = AssettoCorsaEnv()
 
-    # Inizializziamo l'agente PPO (Proximal Policy Optimization)
-    # È l'algoritmo standard per il controllo continuo (guida, robotica)
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, device="cuda")
+    # Inizializziamo o carichiamo l'agente PPO (Proximal Policy Optimization)
+    if os.path.exists(f"{MODEL_PATH}.zip"):
+        print(f"[+] Trovato modello salvato: {MODEL_PATH}.zip. Caricamento in corso...")
+        model = PPO.load(MODEL_PATH, env=env, device="cuda")
+    else:
+        print("[+] Nessun modello trovato. Creazione di un nuovo agente...")
+        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, device="cuda")
 
     print("[!] Assicurati di essere in pista su Assetto Corsa.")
     print("[!] Vai nelle impostazioni del gioco e seleziona il controller Xbox 360 come input.")
@@ -189,11 +196,11 @@ if __name__ == "__main__":
 
     try:
         # Avvia l'apprendimento per 100.000 step (circa un'ora e mezza di guida reale)
-        model.learn(total_timesteps=100000)
+        model.learn(total_timesteps=100000, reset_num_timesteps=False)
     except KeyboardInterrupt:
         print("\n[!] Addestramento interrotto dall'utente.")
     finally:
         # Salva il modello addestrato
-        model.save("ppo_assetto_corsa")
-        print("[+] Modello salvato come 'ppo'_assetto_corsa.zip'.")
+        model.save(MODEL_PATH)
+        print(f"[+] Modello salvato come '{MODEL_PATH}.zip'.")
         env.close()
