@@ -93,57 +93,68 @@ class AssettoCorsaEnv(gym.Env):
         return next_state, reward, terminated, truncated, info
 
     def _compute_reward(self):
-        """Calcola la ricompensa usando le proprietà dirette del driver (asm.property)"""
-        # Lettura dati diretti dal driver custom
+        """Calcola la ricompensa ottimizzata per accelerazione, direzione e sopravvivenza"""
         speed_kmh = getattr(self.asm, "speed", 0.0)
         rpm = getattr(self.asm, "rpm", 0.0)
         gear = getattr(self.asm, "gear", 0)
         tyres_out = getattr(self.asm, "numberOfTyresOut", 0)
+        
+        # Velocità locale (Z è longitudinale, X è laterale)
+        vz = getattr(self.asm, "localVelocityZ", 0.0)
+        
+        # Slittamento ruote (per essere "attento" al grip)
+        slip = getattr(self.asm, "wheelSlip", [0.0]*4)
+        avg_slip = np.mean(np.abs(slip)) if isinstance(slip, list) else 0.0
 
-        # Danni vettura (il nostro driver li carica come attributi separati)
+        # Danni vettura
         dmg_f = getattr(self.asm, "carDamagefront", 0.0)
         dmg_r = getattr(self.asm, "carDamagerear", 0.0)
         dmg_l = getattr(self.asm, "carDamageleft", 0.0)
         dmg_right = getattr(self.asm, "carDamageright", 0.0)
 
-
-
-
-        numberOfTyresOut = getattr(self.asm,"numberOfTyresOut",0)
-
-
         reward = 0.0
         terminated = False
 
-        # 1. Premio per la velocità
+        # 1. Premio Sopravvivenza (Incentiva a non resettare)
+        reward += 10.0
+
+        # 2. Premio Velocità Progressiva (Incentiva ad andare AVANTI veloce)
+        # vz è in m/s, lo premiamo molto se positivo
+        if vz > 0:
+            reward += vz * 10.0 # Premia la velocità in avanti
+        else:
+            reward -= 20.0 # Penalizza se va all'indietro o è fermo con marcia inserita
+
+        # Aggiungiamo comunque un premio alla velocità scalare per l'accelerazione pura
         reward += speed_kmh * 2.0
 
-        if numberOfTyresOut >= 3:
-            print(f"[!] FUORI PISTA!")
-            reward -= 200.0
-            terminated = True
-
-        # 2. Penalità Fuoripista
+        # 3. Penalità Fuoripista
         if tyres_out >= 3:
             print(f"[!] FUORI PISTA! (TyresOut:{tyres_out})")
-            reward -= 200.0
+            reward -= 2000.0
             terminated = True
+        elif tyres_out > 0:
+            reward -= 200.0
 
-        # 3. Penalità Danni
+        # 4. Penalità Danni (Massima attenzione)
         if dmg_f > 0 or dmg_r > 0 or dmg_l > 0 or dmg_right > 0:
             print("[!] DANNO RILEVATO!")
-            reward -= 500.0
+            reward -= 5000.0
             terminated = True
 
-        # 4. Efficienza marce (Shift logic)
-        if speed_kmh > 10:
-            if gear > 2: reward += 10.0
-            if rpm > 6000: reward += 100.0
-            if rpm < 2500: reward -= 5.0
+        # 5. Controllo Trazione / Attenzione (Slip)
+        if avg_slip > 1.0:
+            reward -= avg_slip * 5.0 # Penalizza se slitta troppo (spreco energia/perdita controllo)
 
-            # 5. Penalità stallo
-        if speed_kmh < 5.0:
-            reward -= 1.0
+        # 6. Efficienza marce e RPM
+        if speed_kmh > 10:
+            if rpm > 6500: reward += 50.0
+            if gear >= 2: reward += 20.0
+            if rpm < 2500 and gear > 1: reward -= 30.0
+
+        # 7. Penalità Inattività pesante
+        if speed_kmh < 2.0:
+            reward -= 50.0
 
         return reward, terminated
 
