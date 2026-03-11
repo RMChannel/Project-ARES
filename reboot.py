@@ -16,5 +16,5 @@ def reboot():
 if __name__ == "__main__":
     print(pyautogui.position())
     print("Starting in 60 seconds...")
-    time.sleep(5)
+    time.sleep(60)
     reboot()

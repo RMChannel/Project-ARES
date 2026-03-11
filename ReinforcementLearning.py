@@ -110,21 +110,27 @@ class AssettoCorsaEnv(gym.Env):
         is_off_track = getattr(physics, "numberOfTyresOut", 0) >= 3  # Penalità se esce di pista
         rpm = getattr(physics,"rpm", 0.0)
         gear = getattr(physics,"gear",0)
+        car_damage = getattr(physics, "car_damage", None)
 
 
         reward = 0.0
         terminated = False
 
         # Premio per la velocità (incoraggia l'IA ad andare avanti)
-        reward += speed_kmh / 10.0
+        reward += speed_kmh
+
+        if car_damage.front > 0 or car_damage.left > 0 or car_damage.right > 0 or car_damage.center > 0 or car_damage.rear > 0:
+            reward-=100
+            terminated=True
 
         # Penalità estreme
         if is_off_track:
+            print("Dio can son fuori")
             reward -= 50.0
             terminated = True  # Fine dell'episodio se esce di pista
 
         if speed_kmh < 2.0:
-            reward -= 1.0  # Penalità per lo stallo
+            reward -= 10.0  # Penalità per lo stallo
 
         if rpm < 1000:
             reward -= 10.0
@@ -151,10 +157,12 @@ class AssettoCorsaEnv(gym.Env):
         print("[*] Eseguendo il reboot della sessione...")
         pyautogui.hotkey('ctrl', 'r')
         time.sleep(2)
-        
+
         # Clicca sul pulsante di conferma/restart (coordinate da reboot.py)
-        target_x = 52
-        target_y = 181
+        target_x = 1335
+        target_y = 904
+        pyautogui.click(x=target_x, y=target_y)
+        pyautogui.click(x=target_x, y=target_y)
         pyautogui.click(x=target_x, y=target_y)
         
         # Attesa per stabilizzare l'auto e caricamento sessione
