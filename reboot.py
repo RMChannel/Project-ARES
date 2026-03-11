@@ -6,8 +6,8 @@ def reboot():
 
     time.sleep(2)
 
-    target_x = 52
-    target_y = 181
+    target_x = 59
+    target_y = 171
 
     pyautogui.click(x=target_x, y=target_y)
 

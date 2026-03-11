@@ -125,7 +125,6 @@ class AssettoCorsaEnv(gym.Env):
 
         # Penalità estreme
         if is_off_track:
-            print("Dio can son fuori")
             reward -= 50.0
             terminated = True  # Fine dell'episodio se esce di pista
 
@@ -159,8 +158,8 @@ class AssettoCorsaEnv(gym.Env):
         time.sleep(2)
 
         # Clicca sul pulsante di conferma/restart (coordinate da reboot.py)
-        target_x = 1335
-        target_y = 904
+        target_x = 59
+        target_y = 171
         pyautogui.click(x=target_x, y=target_y)
         pyautogui.click(x=target_x, y=target_y)
         pyautogui.click(x=target_x, y=target_y)
@@ -181,7 +180,7 @@ if __name__ == "__main__":
 
     # Inizializziamo l'agente PPO (Proximal Policy Optimization)
     # È l'algoritmo standard per il controllo continuo (guida, robotica)
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, device="cuda")
+    model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0003, device="cuda")
 
     print("[!] Assicurati di essere in pista su Assetto Corsa.")
     print("[!] Vai nelle impostazioni del gioco e seleziona il controller Xbox 360 come input.")
