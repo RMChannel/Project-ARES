@@ -1,82 +1,71 @@
 import os
 import time
-from turtle import Terminator
-
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from stable_baselines3 import PPO
-from pyaccsharedmemory import accSharedMemory
 import vgamepad as vg
 import pyautogui
 
+# Importiamo il nuovo driver custom
+import driver
+
+
+distance_done = 0
+
 # ========== COSTANTI ==========
-
-
 MAX_STEER_DEG = 540.0
-TARGET_SPEED_KMH = 150.0  # Velocità che l'IA proverà a mantenere/raggiungere
-REFRESH_RATE = 0.05  # 20 Hz (50ms per step)
+TARGET_SPEED_KMH = 150.0
+REFRESH_RATE = 0.05
 MODEL_PATH = "ppo_assetto_corsa"
 
 
-
-
-
 class AssettoCorsaEnv(gym.Env):
-    """Ambiente Custom per Assetto Corsa compatibile con Stable Baselines 3"""
+    """Ambiente Custom per Assetto Corsa compatibile con SB3"""
 
     def __init__(self):
         super(AssettoCorsaEnv, self).__init__()
 
-        # Connessione ad AC
+        # Inizializza il driver custom
         self.asm = self._connect_shared_memory()
 
-
-
-        # Controller virtuale Xbox 360 (Verrà visto da AC come un joypad)
+        # Controller virtuale Xbox 360
         self.gamepad = vg.VX360Gamepad()
 
-        # ========== SPAZIO DELLE AZIONI ==========
-        # Array di 3 valori continui tra -1.0 e 1.0: [Sterzo, Acceleratore, Freno]
+        # SPAZIO AZIONI: [Sterzo, Acceleratore, Freno] tra -1.0 e 1.0
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
-        # ========== SPAZIO DELLE OSSERVAZIONI (Stato) ==========
-        # Array di 5 valori continui: [speed_norm, norm_pos, vx, vy, rpm_norm]
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
+        # SPAZIO OSSERVAZIONI: [speed_norm, vx, vy, rpm_norm] (norm_pos rimosso, serve Graphics SHM)
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
 
     def _connect_shared_memory(self):
+        reader = driver.AssettoCorsaData()
         while True:
             try:
-                asm = accSharedMemory()
-                print("[+] Connessione Shared Memory OK")
-                return asm
-            except:
+                reader.start()
+                # Verifica rapida
+                reader.update()
+                print("[Driver] Connessione Shared Memory OK")
+                return reader
+            except Exception as e:
                 print("[-] In attesa di Assetto Corsa...", end="\r")
                 time.sleep(1)
 
     def _get_state(self):
-        """Legge i dati dalla telemetria e li normalizza per la rete neurale."""
-        sm = self.asm.read_shared_memory()
-        if sm is None or sm.Physics is None:
-            return np.zeros(5, dtype=np.float32)
-
-        physics = sm.Physics
-        graphics = sm.Graphics
-
-        speed = getattr(physics, "speed_kmh", 0.0)
-        vx = getattr(physics, "localVelocityX", speed)
-        vy = getattr(physics, "localVelocityY", 0.0)
-        rpm = getattr(physics, "rpm", 0)
-        norm_pos = getattr(graphics, "normalizedCarPosition", 0.0)
+        """Ottiene lo stato corrente usando la dot notation dal driver."""
+        # I valori sono già aggiornati grazie a self.asm.update() chiamato in step()
+        speed = getattr(self.asm, "speed", 0.0)
+        vx = getattr(self.asm, "localVelocityX", 0.0)
+        vy = getattr(self.asm, "localVelocityY", 0.0)
+        rpm = getattr(self.asm, "rpm", 0.0)
 
         # Normalizzazione
         speed_norm = np.clip(speed / 300.0, 0.0, 1.0)
-        rpm_norm = np.clip(rpm / 8000.0, 0.0, 1.0)  # Assumiamo max 8000 rpm
+        rpm_norm = np.clip(rpm / 8000.0, 0.0, 1.0)
 
-        return np.array([speed_norm, norm_pos, vx / 100.0, vy / 100.0, rpm_norm], dtype=np.float32)
+        return np.array([speed_norm, vx / 100.0, vy / 100.0, rpm_norm], dtype=np.float32)
 
     def step(self, action):
-        """Esegue l'azione, aspetta un tick, calcola la ricompensa e restituisce il nuovo stato."""
         steer, throttle, brake = action
 
         # 1. Applica le azioni al controller virtuale
@@ -84,6 +73,7 @@ class AssettoCorsaEnv(gym.Env):
 
         t_val = float(np.clip((throttle + 1) / 2, 0.0, 1.0))
         b_val = float(np.clip((brake + 1) / 2, 0.0, 1.0))
+
         self.gamepad.right_trigger_float(value_float=t_val)
         self.gamepad.left_trigger_float(value_float=b_val)
         self.gamepad.update()
@@ -91,98 +81,97 @@ class AssettoCorsaEnv(gym.Env):
         # 2. Aspetta che il gioco processi l'input
         time.sleep(REFRESH_RATE)
 
-        # 3. Leggi il nuovo stato e la memoria condivisa
+        # 3. Leggi il nuovo stato aggiornando il driver
+        self.asm.update()
         next_state = self._get_state()
-        sm = self.asm.read_shared_memory()
-
-        # FIX: Evitiamo il crash se la memoria condivisa è momentaneamente inaccessibile
-        physics = sm.Physics if sm is not None else None
-        graphics = sm.Graphics if sm is not None else None
 
         # 4. Calcola la Reward
-        reward, terminated = self._compute_reward(physics, graphics)
+        reward, terminated = self._compute_reward()
         truncated = False
         info = {}
 
         return next_state, reward, terminated, truncated, info
 
-    def _compute_reward(self, physics, graphics):
-        """La funzione vitale: dice all'IA se sta facendo bene o male."""
-        if physics is None or graphics is None:
-            return 0.0, False
+    def _compute_reward(self):
+        """Calcola la ricompensa usando le proprietà dirette del driver (asm.property)"""
+        # Lettura dati diretti dal driver custom
+        speed_kmh = getattr(self.asm, "speed", 0.0)
+        rpm = getattr(self.asm, "rpm", 0.0)
+        gear = getattr(self.asm, "gear", 0)
+        tyres_out = getattr(self.asm, "numberOfTyresOut", 0)
 
-        speed_kmh = getattr(physics, "speed_kmh", 0.0)
-        is_off_track = getattr(physics, "numberOfTyresOut", 0) >= 3  # Penalità se esce di pista
-        rpm = getattr(physics,"rpm", 0.0)
-        gear = getattr(physics,"gear",0)
-        car_damage = getattr(physics, "car_damage", None)
-        ACC_PENALTY_TYPE = getattr(physics, "ACC_PENALTY_TYPE", 0)
+        # Danni vettura (il nostro driver li carica come attributi separati)
+        dmg_f = getattr(self.asm, "carDamagefront", 0.0)
+        dmg_r = getattr(self.asm, "carDamagerear", 0.0)
+        dmg_l = getattr(self.asm, "carDamageleft", 0.0)
+        dmg_right = getattr(self.asm, "carDamageright", 0.0)
+
+
+
+
+        numberOfTyresOut = getattr(self.asm,"numberOfTyresOut",0)
 
 
         reward = 0.0
         terminated = False
 
-        # Premio per la velocità (incoraggia l'IA ad andare avanti)
-        reward += speed_kmh * 2.5
+        # 1. Premio per la velocità
+        reward += speed_kmh * 2.0
 
-        if car_damage.front > 0 or car_damage.left > 0 or car_damage.right > 0 or car_damage.center > 0 or car_damage.rear > 0:
-            reward-=100
-            terminated=True
-
-        # Penalità estreme
-        if is_off_track:
-            print("Dio can son fuori")
-            reward -= 50.0
-            terminated = True  # Fine dell'episodio se esce di pista
-
-        if speed_kmh < 2.0:
-            reward -= 10.0  # Penalità per lo stallo
-
-        if rpm < 1000:
-            reward -= 10.0
-
-        if ACC_PENALTY_TYPE > 0 :
-            reward -= 100.0
+        if numberOfTyresOut >= 3:
+            print(f"[!] FUORI PISTA!")
+            reward -= 200.0
             terminated = True
 
-        #Facciamo in modo che aumenti la marcia
-        if gear < 2:
-            reward -= 5.0
-        if rpm > 4000:
-            reward += 50
+        # 2. Penalità Fuoripista
+        if tyres_out >= 3:
+            print(f"[!] FUORI PISTA! (TyresOut:{tyres_out})")
+            reward -= 200.0
+            terminated = True
+
+        # 3. Penalità Danni
+        if dmg_f > 0 or dmg_r > 0 or dmg_l > 0 or dmg_right > 0:
+            print("[!] DANNO RILEVATO!")
+            reward -= 500.0
+            terminated = True
+
+        # 4. Efficienza marce (Shift logic)
+        if speed_kmh > 10:
+            if gear > 2: reward += 10.0
+            if rpm > 6000: reward += 100.0
+            if rpm < 2500: reward -= 5.0
+
+            # 5. Penalità stallo
+        if speed_kmh < 5.0:
+            reward -= 1.0
 
         return reward, terminated
 
     def reset(self, seed=None, options=None):
-        """Riporta l'ambiente allo stato iniziale.
-        In AC utilizziamo pyautogui per premere il tasto 'Restart' sessione."""
         super().reset(seed=seed)
 
-        # Resettiamo i controlli prima del reboot
+        # Resettiamo i controlli
         self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
         self.gamepad.right_trigger_float(value_float=0.0)
         self.gamepad.left_trigger_float(value_float=0.0)
         self.gamepad.update()
 
-        # Logica di reboot presa da reboot.py
         print("[*] Eseguendo il reboot della sessione...")
         pyautogui.hotkey('ctrl', 'r')
         time.sleep(2)
 
-        # Clicca sul pulsante di conferma/restart (coordinate da reboot.py)
         target_x = 1335
         target_y = 904
-        pyautogui.click(x=target_x, y=target_y)
-        pyautogui.click(x=target_x, y=target_y)
-        pyautogui.click(x=target_x, y=target_y)
-        
-        # Attesa per stabilizzare l'auto e caricamento sessione
+        pyautogui.click(x=target_x, y=target_y, clicks=3, interval=0.1)
+
         time.sleep(5)
 
+        # Aggiorna subito lo stato prima di restituirlo
+        self.asm.update()
         return self._get_state(), {}
 
     def close(self):
-        self.asm.close()
+        self.asm.stop()
 
 
 # ========== MAIN TRAINING LOOP ==========
@@ -190,25 +179,22 @@ if __name__ == "__main__":
     print("[+] Inizializzazione Ambiente Assetto Corsa...")
     env = AssettoCorsaEnv()
 
-    # Inizializziamo o carichiamo l'agente PPO (Proximal Policy Optimization)
     if os.path.exists(f"{MODEL_PATH}.zip"):
-        print(f"[+] Trovato modello salvato: {MODEL_PATH}.zip. Caricamento in corso...")
+        print(f"[+] Trovato modello: {MODEL_PATH}.zip. Caricamento in corso...")
         model = PPO.load(MODEL_PATH, env=env, device="cuda")
     else:
-        print("[+] Nessun modello trovato. Creazione di un nuovo agente...")
-        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, device="cuda")
+        print("[+] Nessun modello trovato. Creazione nuovo agente...")
+        model = PPO("MlpPolicy", env, verbose=0, learning_rate=0.0001, device="cuda")
 
-    print("[!] Assicurati di essere in pista su Assetto Corsa.")
-    print("[!] Vai nelle impostazioni del gioco e seleziona il controller Xbox 360 come input.")
+    print("[!] Assicurati di essere in pista.")
+    print("[!] Input gioco: Controller Xbox 360.")
     print("[+] Inizio addestramento (Premi Ctrl+C per fermare e salvare)...")
 
     try:
-        # Avvia l'apprendimento per 100.000 step (circa un'ora e mezza di guida reale)
         model.learn(total_timesteps=100000, reset_num_timesteps=False)
     except KeyboardInterrupt:
-        print("\n[!] Addestramento interrotto dall'utente.")
+        print("\n[!] Addestramento interrotto.")
     finally:
-        # Salva il modello addestrato
         model.save(MODEL_PATH)
         print(f"[+] Modello salvato come '{MODEL_PATH}.zip'.")
         env.close()
