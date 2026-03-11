@@ -1,5 +1,7 @@
 import os
 import time
+from turtle import Terminator
+
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -114,6 +116,7 @@ class AssettoCorsaEnv(gym.Env):
         rpm = getattr(physics,"rpm", 0.0)
         gear = getattr(physics,"gear",0)
         car_damage = getattr(physics, "car_damage", None)
+        ACC_PENALTY_TYPE = getattr(physics, "ACC_PENALTY_TYPE", 0)
 
 
         reward = 0.0
@@ -138,6 +141,9 @@ class AssettoCorsaEnv(gym.Env):
         if rpm < 1000:
             reward -= 10.0
 
+        if ACC_PENALTY_TYPE > 0 :
+            reward -= 100.0
+            terminated = True
 
         #Facciamo in modo che aumenti la marcia
         if gear < 2:
