@@ -120,7 +120,7 @@ class AssettoCorsaEnv(gym.Env):
         terminated = False
 
         # Premio per la velocità (incoraggia l'IA ad andare avanti)
-        reward += speed_kmh
+        reward += speed_kmh * 2.5
 
         if car_damage.front > 0 or car_damage.left > 0 or car_damage.right > 0 or car_damage.center > 0 or car_damage.rear > 0:
             reward-=100
@@ -142,6 +142,8 @@ class AssettoCorsaEnv(gym.Env):
         #Facciamo in modo che aumenti la marcia
         if gear < 2:
             reward -= 5.0
+        if rpm > 4000:
+            reward += 50
 
         return reward, terminated
 
