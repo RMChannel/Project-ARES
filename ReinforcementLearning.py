@@ -5,6 +5,7 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 from pyaccsharedmemory import accSharedMemory
 import vgamepad as vg
+import pyautogui
 
 # ========== COSTANTI ==========
 
@@ -137,17 +138,27 @@ class AssettoCorsaEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         """Riporta l'ambiente allo stato iniziale.
-        In AC questo è complesso, richiederebbe una mod o la pressione del tasto 'Restart'
-        tramite tastiera virtuale. Qui resettiamo semplicemente i controlli."""
+        In AC utilizziamo pyautogui per premere il tasto 'Restart' sessione."""
         super().reset(seed=seed)
 
+        # Resettiamo i controlli prima del reboot
         self.gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
         self.gamepad.right_trigger_float(value_float=0.0)
         self.gamepad.left_trigger_float(value_float=0.0)
         self.gamepad.update()
 
-        # Attesa per stabilizzare l'auto (idealmente qui c'è un input per riavviare la sessione)
+        # Logica di reboot presa da reboot.py
+        print("[*] Eseguendo il reboot della sessione...")
+        pyautogui.hotkey('ctrl', 'r')
         time.sleep(2)
+        
+        # Clicca sul pulsante di conferma/restart (coordinate da reboot.py)
+        target_x = 52
+        target_y = 181
+        pyautogui.click(x=target_x, y=target_y)
+        
+        # Attesa per stabilizzare l'auto e caricamento sessione
+        time.sleep(5)
 
         return self._get_state(), {}
 
