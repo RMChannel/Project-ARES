@@ -1,5 +1,5 @@
-import os
 import time
+import os
 from turtle import Terminator
 
 import numpy as np
@@ -116,22 +116,24 @@ class AssettoCorsaEnv(gym.Env):
         rpm = getattr(physics,"rpm", 0.0)
         gear = getattr(physics,"gear",0)
         car_damage = getattr(physics, "car_damage", None)
-        ACC_PENALTY_TYPE = getattr(physics, "ACC_PENALTY_TYPE", 0)
+        brake = physics.brake
 
 
         reward = 0.0
         terminated = False
 
         # Premio per la velocità (incoraggia l'IA ad andare avanti)
-        reward += speed_kmh * 2.5
+        reward += speed_kmh
 
         if car_damage.front > 0 or car_damage.left > 0 or car_damage.right > 0 or car_damage.center > 0 or car_damage.rear > 0:
             reward-=100
             terminated=True
 
+        if brake>=0.70:
+            reward-=50
+
         # Penalità estreme
         if is_off_track:
-            print("Dio can son fuori")
             reward -= 50.0
             terminated = True  # Fine dell'episodio se esce di pista
 
@@ -141,15 +143,9 @@ class AssettoCorsaEnv(gym.Env):
         if rpm < 1000:
             reward -= 10.0
 
-        if ACC_PENALTY_TYPE > 0 :
-            reward -= 100.0
-            terminated = True
-
         #Facciamo in modo che aumenti la marcia
         if gear < 2:
             reward -= 5.0
-        if rpm > 4000:
-            reward += 50
 
         return reward, terminated
 
@@ -170,8 +166,8 @@ class AssettoCorsaEnv(gym.Env):
         time.sleep(2)
 
         # Clicca sul pulsante di conferma/restart (coordinate da reboot.py)
-        target_x = 1335
-        target_y = 904
+        target_x = 1323
+        target_y = 925
         pyautogui.click(x=target_x, y=target_y)
         pyautogui.click(x=target_x, y=target_y)
         pyautogui.click(x=target_x, y=target_y)
@@ -190,7 +186,6 @@ if __name__ == "__main__":
     print("[+] Inizializzazione Ambiente Assetto Corsa...")
     env = AssettoCorsaEnv()
 
-    # Inizializziamo o carichiamo l'agente PPO (Proximal Policy Optimization)
     if os.path.exists(f"{MODEL_PATH}.zip"):
         print(f"[+] Trovato modello salvato: {MODEL_PATH}.zip. Caricamento in corso...")
         model = PPO.load(MODEL_PATH, env=env, device="cuda")
@@ -198,17 +193,18 @@ if __name__ == "__main__":
         print("[+] Nessun modello trovato. Creazione di un nuovo agente...")
         model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, device="cuda")
 
+
     print("[!] Assicurati di essere in pista su Assetto Corsa.")
     print("[!] Vai nelle impostazioni del gioco e seleziona il controller Xbox 360 come input.")
     print("[+] Inizio addestramento (Premi Ctrl+C per fermare e salvare)...")
 
     try:
         # Avvia l'apprendimento per 100.000 step (circa un'ora e mezza di guida reale)
-        model.learn(total_timesteps=100000, reset_num_timesteps=False)
+        model.learn(total_timesteps=10000000)
     except KeyboardInterrupt:
         print("\n[!] Addestramento interrotto dall'utente.")
     finally:
         # Salva il modello addestrato
-        model.save(MODEL_PATH)
-        print(f"[+] Modello salvato come '{MODEL_PATH}.zip'.")
+        model.save("ppo_assetto_corsa")
+        print("[+] Modello salvato come 'ppo'_assetto_corsa.zip'.")
         env.close()
