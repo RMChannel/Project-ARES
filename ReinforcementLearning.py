@@ -9,6 +9,7 @@ from stable_baselines3 import PPO
 from pyaccsharedmemory import accSharedMemory
 import vgamepad as vg
 import pyautogui
+import driver
 
 try:
     from src.racing_line import RacingLine, load_racing_line_for_track
@@ -34,6 +35,8 @@ class AssettoCorsaEnv(gym.Env):
 
         # Connessione ad AC
         self.asm = self._connect_shared_memory()
+
+
 
         # Racing Line (Traiettoria ideale — auto-detect dal circuito corrente)
         self.racing_line = None
