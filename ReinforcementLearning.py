@@ -193,7 +193,7 @@ class AssettoCorsaEnv(gym.Env):
         # ========== COMPOSIZIONE REWARD (Bilanciata e Prioritizzata) ==========
         # Obiettivo: Valori simili in scala, ma: Linea > Progresso > Velocità > Accelerazione
         
-        r_line = 15.0 * (line_proximity_score * 0.7 + heading_score * 0.3)
+        r_line = 15.0 * (line_proximity_score * 3 + heading_score * 1)
         r_progress = 10.0 * progress_score
         r_velocity = 5.0 * speed_score
         r_accel = 2.0 * accel_score
