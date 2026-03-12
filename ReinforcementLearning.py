@@ -10,6 +10,11 @@ from pyaccsharedmemory import accSharedMemory
 import vgamepad as vg
 import pyautogui
 
+try:
+    from src.racing_line import RacingLine, load_racing_line_for_track
+except ImportError:
+    from racing_line import RacingLine, load_racing_line_for_track
+
 # ========== COSTANTI ==========
 
 
@@ -17,7 +22,6 @@ MAX_STEER_DEG = 540.0
 TARGET_SPEED_KMH = 150.0  # Velocità che l'IA proverà a mantenere/raggiungere
 REFRESH_RATE = 0.05  # 20 Hz (50ms per step)
 MODEL_PATH = "ppo_assetto_corsa"
-
 
 
 
@@ -31,7 +35,16 @@ class AssettoCorsaEnv(gym.Env):
         # Connessione ad AC
         self.asm = self._connect_shared_memory()
 
-
+        # Racing Line (Traiettoria ideale — auto-detect dal circuito corrente)
+        self.racing_line = None
+        self._prev_progress = 0.0
+        self._last_traj_score = None
+        self.racing_line = load_racing_line_for_track(asm=self.asm)
+        if self.racing_line:
+            print("[+] Racing line auto-rilevata dal circuito corrente")
+        else:
+            print("[!] Racing line non disponibile per questo circuito — reward traiettoria disabilitata")
+            print("    Registrala con: python src/record_racing_line.py --live")
 
         # Controller virtuale Xbox 360 (Verrà visto da AC come un joypad)
         self.gamepad = vg.VX360Gamepad()
@@ -41,8 +54,9 @@ class AssettoCorsaEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
 
         # ========== SPAZIO DELLE OSSERVAZIONI (Stato) ==========
-        # Array di 5 valori continui: [speed_norm, norm_pos, vx, vy, rpm_norm]
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
+        # 5 base + 3 traiettoria (distanza, heading error, progresso) = 8
+        obs_size = 8 if self.racing_line is not None else 5
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_size,), dtype=np.float32)
 
     def _connect_shared_memory(self):
         while True:
@@ -57,8 +71,9 @@ class AssettoCorsaEnv(gym.Env):
     def _get_state(self):
         """Legge i dati dalla telemetria e li normalizza per la rete neurale."""
         sm = self.asm.read_shared_memory()
+        obs_size = 8 if self.racing_line is not None else 5
         if sm is None or sm.Physics is None:
-            return np.zeros(5, dtype=np.float32)
+            return np.zeros(obs_size, dtype=np.float32)
 
         physics = sm.Physics
         graphics = sm.Graphics
@@ -73,7 +88,21 @@ class AssettoCorsaEnv(gym.Env):
         speed_norm = np.clip(speed / 300.0, 0.0, 1.0)
         rpm_norm = np.clip(rpm / 8000.0, 0.0, 1.0)  # Assumiamo max 8000 rpm
 
-        return np.array([speed_norm, norm_pos, vx / 100.0, vy / 100.0, rpm_norm], dtype=np.float32)
+        state = [speed_norm, norm_pos, vx / 100.0, vy / 100.0, rpm_norm]
+
+        # Feature traiettoria (se racing line disponibile)
+        if self.racing_line is not None:
+            car_coords = getattr(graphics, "carCoordinates", [0.0, 0.0, 0.0])
+            steer_angle = getattr(physics, "steerAngle", 0.0)
+            traj = self.racing_line.compute_trajectory_score(
+                car_coords, car_heading_rad=steer_angle
+            )
+            self._last_traj_score = traj
+            state.append(np.clip(1.0 - traj['distance_norm'], -1.0, 1.0))  # Vicinanza
+            state.append(np.clip(traj['heading_norm'], -1.0, 1.0))          # Heading error
+            state.append(np.clip(traj['progress'], 0.0, 1.0))              # Progresso
+
+        return np.array(state, dtype=np.float32)
 
     def step(self, action):
         """Esegue l'azione, aspetta un tick, calcola la ricompensa e restituisce il nuovo stato."""
@@ -147,6 +176,37 @@ class AssettoCorsaEnv(gym.Env):
         if gear < 2:
             reward -= 5.0
 
+        # ========== REWARD TRAIETTORIA ==========
+        if self.racing_line is not None and self._last_traj_score is not None:
+            traj = self._last_traj_score
+
+            # 1. Premio per vicinanza alla racing line (+5 max)
+            proximity_reward = 5.0 * (1.0 - traj['distance_norm'])
+            reward += proximity_reward
+
+            # 2. Penalità per heading error (-2 max)
+            heading_penalty = -2.0 * abs(traj['heading_norm'])
+            reward += heading_penalty
+
+            # 3. Premio per progresso lungo il tracciato
+            current_progress = traj['progress']
+            delta_progress = current_progress - self._prev_progress
+
+            # Gestione wrap-around (traguardo: 0.99 → 0.01)
+            if delta_progress < -0.5:
+                delta_progress += 1.0
+            elif delta_progress > 0.5:
+                delta_progress = 0.0  # Salto anomalo, ignora
+
+            if delta_progress > 0:
+                reward += 1.0 * delta_progress * 100.0
+
+            self._prev_progress = current_progress
+
+            # 4. Penalità forte per distanza eccessiva (>15m)
+            if traj['distance'] > RacingLine.MAX_DISTANCE:
+                reward -= 30.0
+
         return reward, terminated
 
     def reset(self, seed=None, options=None):
@@ -159,6 +219,10 @@ class AssettoCorsaEnv(gym.Env):
         self.gamepad.right_trigger_float(value_float=0.0)
         self.gamepad.left_trigger_float(value_float=0.0)
         self.gamepad.update()
+
+        # Reset stato traiettoria
+        self._prev_progress = 0.0
+        self._last_traj_score = None
 
         # Logica di reboot presa da reboot.py
         print("[*] Eseguendo il reboot della sessione...")

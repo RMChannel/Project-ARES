@@ -6,12 +6,19 @@ from pyaccsharedmemory import accSharedMemory
 import matplotlib.pyplot as plt
 from collections import deque
 import vgamepad as vg
+from pathlib import Path
+
+try:
+    from src.racing_line import RacingLine, load_racing_line_for_track
+except ImportError:
+    from racing_line import RacingLine, load_racing_line_for_track
 
 class ARESEnv(gym.Env):
     """
     Ambiente Custom per A.R.E.S. basato sulle specifiche di Assetto Corsa e il documento LaTeX.
     """
-    def __init__(self, use_shared_memory=True, use_gamepad=True):
+    def __init__(self, use_shared_memory=True, use_gamepad=True,
+                 racing_line_path=None, track_name=None):
         super(ARESEnv, self).__init__()
         
         self.use_shared_memory = use_shared_memory
@@ -23,6 +30,23 @@ class ARESEnv(gym.Env):
         if use_gamepad:
             self.gamepad = vg.VX360Gamepad()
             print("[+] ARESEnv: Gamepad Virtuale inizializzato")
+
+        # --- RACING LINE (Traiettoria ideale — multi-circuito) ---
+        self.racing_line = None
+        self._prev_progress = 0.0
+        self._last_traj_score = None
+        if racing_line_path is not None:
+            # Path esplicito fornito
+            self.racing_line = RacingLine(racing_line_path)
+            print(f"[+] ARESEnv: Racing line caricata da {racing_line_path}")
+        elif track_name is not None:
+            # Carica per nome circuito
+            self.racing_line = load_racing_line_for_track(track_name)
+        elif self.use_shared_memory and self.asm is not None:
+            # Auto-detect dal circuito corrente in AC
+            self.racing_line = load_racing_line_for_track(asm=self.asm)
+            if self.racing_line:
+                print("[+] ARESEnv: Racing line auto-rilevata dal circuito corrente")
 
         # --- COSTANTI DI NORMALIZZAZIONE (Dal LaTeX) ---
         self.V_MAX = 300.0        
@@ -45,9 +69,11 @@ class ARESEnv(gym.Env):
             dtype=np.float32
         )
 
-        # --- SPAZIO DEGLI STATI (25 Feature) ---
+        # --- SPAZIO DEGLI STATI ---
+        # 25 feature base + 3 traiettoria (distanza, heading error, progresso) = 28
+        obs_size = 28 if self.racing_line is not None else 25
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(25,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(obs_size,), dtype=np.float32
         )
 
     def _connect_asm(self):
@@ -91,7 +117,8 @@ class ARESEnv(gym.Env):
             return self._get_dummy_telemetry()
 
     def _normalize_obs(self, raw):
-        obs = np.zeros(25, dtype=np.float32)
+        obs_size = 28 if self.racing_line is not None else 25
+        obs = np.zeros(obs_size, dtype=np.float32)
         
         obs[0] = raw['speed_kmh'] / self.V_MAX
         obs[1] = raw['normalizedCarPosition']
@@ -117,7 +144,18 @@ class ARESEnv(gym.Env):
         
         for i in range(3):
             obs[22+i] = np.clip(raw['carCoordinates'][i] / self.COORD_MAX, -1, 1)
-            
+
+        # --- Feature Traiettoria (25-27) ---
+        if self.racing_line is not None:
+            traj = self.racing_line.compute_trajectory_score(
+                raw['carCoordinates'],
+                car_heading_rad=raw['steerAngle']  # approssimazione con steerAngle
+            )
+            self._last_traj_score = traj
+            obs[25] = np.clip(1.0 - traj['distance_norm'], -1, 1)  # 1 = sulla linea, 0 = lontano
+            obs[26] = np.clip(traj['heading_norm'], -1, 1)
+            obs[27] = np.clip(traj['progress'], 0, 1)
+
         return obs
 
     def _compute_reward(self, telemetry):
@@ -146,6 +184,44 @@ class ARESEnv(gym.Env):
             if temp < 60.0 or temp > 115.0:
                 reward -= 0.1
 
+        # ========== REWARD TRAIETTORIA ==========
+        if self.racing_line is not None and self._last_traj_score is not None:
+            traj = self._last_traj_score
+
+            # 1. Premio per vicinanza alla racing line (+5 max)
+            proximity_reward = 5.0 * (1.0 - traj['distance_norm'])
+            reward += proximity_reward
+
+            # 2. Penalità per heading error (-2 max)
+            heading_penalty = -2.0 * abs(traj['heading_norm'])
+            reward += heading_penalty
+
+            # 3. Premio per progresso lungo il tracciato
+            current_progress = traj['progress']
+            delta_progress = current_progress - self._prev_progress
+
+            # Gestione wrap-around (quando si attraversa il traguardo: 0.99 → 0.01)
+            if delta_progress < -0.5:
+                delta_progress += 1.0
+            elif delta_progress > 0.5:
+                delta_progress = 0.0  # Salto anomalo, ignora
+
+            if delta_progress > 0:
+                reward += 1.0 * delta_progress * 100.0  # Scala per renderlo significativo
+
+            self._prev_progress = current_progress
+
+            # 4. Penalità forte per distanza eccessiva (>15m)
+            if traj['distance'] > RacingLine.MAX_DISTANCE:
+                reward -= 30.0
+                info['trajectory_warning'] = 'too_far'
+
+            # Log per debug
+            info['traj_distance'] = traj['distance']
+            info['traj_heading_err'] = traj['heading_error']
+            info['traj_progress'] = traj['progress']
+            info['traj_reward'] = proximity_reward + heading_penalty
+
         return reward, done, info
 
     def step(self, action):
@@ -171,7 +247,11 @@ class ARESEnv(gym.Env):
         if self.gamepad:
             self.gamepad.reset()
             self.gamepad.update()
-        
+
+        # Reset stato traiettoria
+        self._prev_progress = 0.0
+        self._last_traj_score = None
+
         raw_telemetry = self._get_telemetry()
         return self._normalize_obs(raw_telemetry), {}
 
