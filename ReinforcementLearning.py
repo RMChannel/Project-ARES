@@ -181,11 +181,11 @@ class AssettoCorsaEnv(gym.Env):
             traj = self._last_traj_score
 
             # 1. Premio per vicinanza alla racing line (+5 max)
-            proximity_reward = 5.0 * (1.0 - traj['distance_norm'])
+            proximity_reward = 20.0 * (1.0 - traj['distance_norm']) - 10
             reward += proximity_reward
 
             # 2. Penalità per heading error (-2 max)
-            heading_penalty = -2.0 * abs(traj['heading_norm'])
+            heading_penalty = -8.0 * abs(traj['heading_norm'])
             reward += heading_penalty
 
             # 3. Premio per progresso lungo il tracciato
