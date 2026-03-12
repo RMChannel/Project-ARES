@@ -38,6 +38,7 @@ class AssettoCorsaEnv(gym.Env):
         # Racing Line (Traiettoria ideale — auto-detect dal circuito corrente)
         self.racing_line = None
         self._prev_progress = 0.0
+        self._prev_speed = 0.0
         self._last_traj_score = None
         self.racing_line = load_racing_line_for_track(asm=self.acc_sm)
         if self.racing_line:
@@ -161,61 +162,70 @@ class AssettoCorsaEnv(gym.Env):
         reward = 0.0
         terminated = False
 
-        # Premio per la velocità (incoraggia l'IA ad andare avanti)
-        reward += speed_kmh
+        # ========== CALCOLO SCORE POSITIVI (Normalizzati 0.0 - 1.0) ==========
+        
+        # 1. Score Racing Line (Vicinanza + Orientamento)
+        line_proximity_score = 0.0
+        heading_score = 0.0
+        progress_score = 0.0
+        
+        if self.racing_line is not None and self._last_traj_score is not None:
+            traj = self._last_traj_score
+            line_proximity_score = np.clip(1.0 - traj['distance_norm'], 0.0, 1.0)
+            heading_score = np.clip(1.0 - abs(traj['heading_norm']), 0.0, 1.0)
+            
+            # Premio per progresso lungo il tracciato
+            current_progress = traj['progress']
+            delta_progress = current_progress - self._prev_progress
+            if delta_progress < -0.5: delta_progress += 1.0
+            elif delta_progress > 0.5: delta_progress = 0.0
+            
+            progress_score = np.clip(delta_progress * 50.0, 0.0, 1.0) # Scalato per essere ~1.0 per step se veloce
+            self._prev_progress = current_progress
+
+        # 2. Score Velocità (Target 250 km/h)
+        speed_score = np.clip(speed_kmh / 250.0, 0.0, 1.0)
+
+        # 3. Score Accelerazione (Premio se la velocità aumenta)
+        accel_score = np.clip((speed_kmh - self._prev_speed) / 2.0, 0.0, 1.0) if speed_kmh > self._prev_speed else 0.0
+        self._prev_speed = speed_kmh
+
+        # ========== COMPOSIZIONE REWARD (Bilanciata e Prioritizzata) ==========
+        # Obiettivo: Valori simili in scala, ma: Linea > Progresso > Velocità > Accelerazione
+        
+        r_line = 15.0 * (line_proximity_score * 0.7 + heading_score * 0.3)
+        r_progress = 10.0 * progress_score
+        r_velocity = 5.0 * speed_score
+        r_accel = 2.0 * accel_score
+        
+        reward = r_line + r_progress + r_velocity + r_accel
+
+        # ========== PENALITÀ E TERMINAZIONI ==========
 
         if has_damage:
             reward -= 100
             terminated = True
 
         if brake >= 0.70:
-            reward -= 50
+            reward -= 10.0 # Ridotto per non scoraggiare troppo la frenata necessaria
 
-        # Penalità estreme
         if is_off_track:
             reward -= 50.0
-            terminated = True  # Fine dell'episodio se esce di pista
+            terminated = True
 
         if speed_kmh < 2.0:
-            reward -= 10.0  # Penalità per lo stallo
-
-        if rpm < 1000:
-            reward -= 10.0
-
-        # Facciamo in modo che aumenti la marcia
-        if gear < 2:
             reward -= 5.0
 
-        # ========== REWARD TRAIETTORIA ==========
+        if rpm < 1000 and speed_kmh > 10:
+            reward -= 5.0
+
+        if gear < 2 and speed_kmh > 50:
+            reward -= 2.0
+
+        # Penalità forte per distanza eccessiva (>15m) se racing line attiva
         if self.racing_line is not None and self._last_traj_score is not None:
-            traj = self._last_traj_score
-
-            # 1. Premio per vicinanza alla racing line (+5 max)
-            proximity_reward = 20.0 * (1.0 - traj['distance_norm']) - 10
-            reward += proximity_reward
-
-            # 2. Penalità per heading error (-2 max)
-            heading_penalty = -8.0 * abs(traj['heading_norm'])
-            reward += heading_penalty
-
-            # 3. Premio per progresso lungo il tracciato
-            current_progress = traj['progress']
-            delta_progress = current_progress - self._prev_progress
-
-            # Gestione wrap-around (traguardo: 0.99 → 0.01)
-            if delta_progress < -0.5:
-                delta_progress += 1.0
-            elif delta_progress > 0.5:
-                delta_progress = 0.0  # Salto anomalo, ignora
-
-            if delta_progress > 0:
-                reward += 1.0 * delta_progress * 100.0
-
-            self._prev_progress = current_progress
-
-            # 4. Penalità forte per distanza eccessiva (>15m)
-            if traj['distance'] > RacingLine.MAX_DISTANCE:
-                reward -= 30.0
+            if self._last_traj_score['distance'] > RacingLine.MAX_DISTANCE:
+                reward -= 20.0
 
         return reward, terminated
 
@@ -230,8 +240,9 @@ class AssettoCorsaEnv(gym.Env):
         self.gamepad.left_trigger_float(value_float=0.0)
         self.gamepad.update()
 
-        # Reset stato traiettoria
+        # Reset stato traiettoria e velocità
         self._prev_progress = 0.0
+        self._prev_speed = 0.0
         self._last_traj_score = None
 
         # Logica di reboot presa da reboot.py
