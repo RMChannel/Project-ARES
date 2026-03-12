@@ -11,10 +11,7 @@ import vgamepad as vg
 import pyautogui
 import driver
 
-try:
-    from src.racing_line import RacingLine, load_racing_line_for_track
-except ImportError:
-    from racing_line import RacingLine, load_racing_line_for_track
+from src.racing_line import RacingLine, load_racing_line_for_track
 
 # ========== COSTANTI ==========
 
@@ -33,16 +30,16 @@ class AssettoCorsaEnv(gym.Env):
     def __init__(self):
         super(AssettoCorsaEnv, self).__init__()
 
-        # Connessione ad AC
-        self.asm = self._connect_shared_memory()
-
-
+        # Connessione ad AC (Hybrid: driver.py for physics, pyaccsharedmemory for graphics/statics)
+        self.acc_sm = self._connect_shared_memory()
+        self.asm = driver.AssettoCorsaData()
+        self.asm.start()
 
         # Racing Line (Traiettoria ideale — auto-detect dal circuito corrente)
         self.racing_line = None
         self._prev_progress = 0.0
         self._last_traj_score = None
-        self.racing_line = load_racing_line_for_track(asm=self.asm)
+        self.racing_line = load_racing_line_for_track(asm=self.acc_sm)
         if self.racing_line:
             print("[+] Racing line auto-rilevata dal circuito corrente")
         else:
@@ -73,18 +70,22 @@ class AssettoCorsaEnv(gym.Env):
 
     def _get_state(self):
         """Legge i dati dalla telemetria e li normalizza per la rete neurale."""
-        sm = self.asm.read_shared_memory()
+        self.asm.update()  # Aggiorna dati da driver.py
+        sm = self.acc_sm.read_shared_memory()
+        
         obs_size = 8 if self.racing_line is not None else 5
-        if sm is None or sm.Physics is None:
+        if sm is None or sm.Graphics is None:
             return np.zeros(obs_size, dtype=np.float32)
 
-        physics = sm.Physics
         graphics = sm.Graphics
 
-        speed = getattr(physics, "speed_kmh", 0.0)
-        vx = getattr(physics, "localVelocityX", speed)
-        vy = getattr(physics, "localVelocityY", 0.0)
-        rpm = getattr(physics, "rpm", 0)
+        # Dati da driver.py (self.asm)
+        speed = getattr(self.asm, "speed", 0.0)
+        vx = getattr(self.asm, "localVelocityX", speed)
+        vy = getattr(self.asm, "localVelocityY", 0.0)
+        rpm = getattr(self.asm, "rpm", 0)
+        
+        # Dati da pyaccsharedmemory (sm.Graphics)
         norm_pos = getattr(graphics, "normalizedCarPosition", 0.0)
 
         # Normalizzazione
@@ -96,7 +97,7 @@ class AssettoCorsaEnv(gym.Env):
         # Feature traiettoria (se racing line disponibile)
         if self.racing_line is not None:
             car_coords = getattr(graphics, "carCoordinates", [0.0, 0.0, 0.0])
-            steer_angle = getattr(physics, "steerAngle", 0.0)
+            steer_angle = getattr(self.asm, "steerAngle", 0.0)
             traj = self.racing_line.compute_trajectory_score(
                 car_coords, car_heading_rad=steer_angle
             )
@@ -125,7 +126,7 @@ class AssettoCorsaEnv(gym.Env):
 
         # 3. Leggi il nuovo stato e la memoria condivisa
         next_state = self._get_state()
-        sm = self.asm.read_shared_memory()
+        sm = self.acc_sm.read_shared_memory()
 
         # FIX: Evitiamo il crash se la memoria condivisa è momentaneamente inaccessibile
         physics = sm.Physics if sm is not None else None
@@ -140,16 +141,22 @@ class AssettoCorsaEnv(gym.Env):
 
     def _compute_reward(self, physics, graphics):
         """La funzione vitale: dice all'IA se sta facendo bene o male."""
-        if physics is None or graphics is None:
+        if graphics is None:
             return 0.0, False
 
-        speed_kmh = getattr(physics, "speed_kmh", 0.0)
-        is_off_track = getattr(physics, "numberOfTyresOut", 0) >= 3  # Penalità se esce di pista
-        rpm = getattr(physics,"rpm", 0.0)
-        gear = getattr(physics,"gear",0)
-        car_damage = getattr(physics, "car_damage", None)
-        brake = physics.brake
-
+        # Usiamo self.asm (driver.py) per la maggior parte dei dati fisica
+        speed_kmh = getattr(self.asm, "speed", 0.0)
+        is_off_track = getattr(self.asm, "numberOfTyresOut", 0) >= 3  # Penalità se esce di pista
+        rpm = getattr(self.asm, "rpm", 0.0)
+        gear = getattr(self.asm, "gear", 0)
+        brake = getattr(self.asm, "brake", 0.0)
+        
+        # Danni (driver.py ha campi piatti)
+        has_damage = (getattr(self.asm, "carDamagefront", 0) > 0 or 
+                      getattr(self.asm, "carDamageleft", 0) > 0 or 
+                      getattr(self.asm, "carDamageright", 0) > 0 or 
+                      getattr(self.asm, "carDamagecentre", 0) > 0 or 
+                      getattr(self.asm, "carDamagerear", 0) > 0)
 
         reward = 0.0
         terminated = False
@@ -157,12 +164,12 @@ class AssettoCorsaEnv(gym.Env):
         # Premio per la velocità (incoraggia l'IA ad andare avanti)
         reward += speed_kmh
 
-        if car_damage.front > 0 or car_damage.left > 0 or car_damage.right > 0 or car_damage.center > 0 or car_damage.rear > 0:
-            reward-=100
-            terminated=True
+        if has_damage:
+            reward -= 100
+            terminated = True
 
-        if brake>=0.70:
-            reward-=50
+        if brake >= 0.70:
+            reward -= 50
 
         # Penalità estreme
         if is_off_track:
@@ -175,7 +182,7 @@ class AssettoCorsaEnv(gym.Env):
         if rpm < 1000:
             reward -= 10.0
 
-        #Facciamo in modo che aumenti la marcia
+        # Facciamo in modo che aumenti la marcia
         if gear < 2:
             reward -= 5.0
 
@@ -245,7 +252,10 @@ class AssettoCorsaEnv(gym.Env):
         return self._get_state(), {}
 
     def close(self):
-        self.asm.close()
+        if hasattr(self, 'asm'):
+            self.asm.stop()
+        if hasattr(self, 'acc_sm'):
+            self.acc_sm.close()
 
 
 # ========== MAIN TRAINING LOOP ==========
@@ -258,7 +268,7 @@ if __name__ == "__main__":
         model = PPO.load(MODEL_PATH, env=env, device="cuda")
     else:
         print("[+] Nessun modello trovato. Creazione di un nuovo agente...")
-        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, device="cuda")
+        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.005, device="cuda")
 
 
     print("[!] Assicurati di essere in pista su Assetto Corsa.")
