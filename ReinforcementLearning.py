@@ -227,6 +227,7 @@ class AssettoCorsaEnv(gym.Env):
             if self._last_traj_score['distance'] > RacingLine.MAX_DISTANCE:
                 reward -= 20.0
 
+        print(reward)
         return reward, terminated
 
     def reset(self, seed=None, options=None):
