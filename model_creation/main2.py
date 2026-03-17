@@ -5,7 +5,6 @@ import numpy as np
 import time
 import os
 from torch.distributions import Normal
-
 # Importiamo il tuo file fast_lane_api (deve essere nella stessa cartella)
 import read_ai as fast_lane_api
 
@@ -33,7 +32,6 @@ def load_real_track(file_path="fast_lane.ai"):
     # Convertiamo la lista in un tensore PyTorch
     track_tensor = torch.tensor(points, dtype=torch.float32, device=DEVICE)
     print(f"Tracciato caricato con successo: {len(track_tensor)} waypoints.")
-    
     return track_tensor
 
 # --- 2. IL CERVELLO (Rete Neurale) ---

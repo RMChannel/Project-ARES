@@ -8,4 +8,3 @@
 7) Next Curve Direction con X c {-1, +1} sinistra destra
 
 
-
