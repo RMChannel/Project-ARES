@@ -14,11 +14,15 @@ def draw_circuit(points):
     screen.title("Circuit Test Viewer")
     screen.bgcolor("black")
 
+    # 2. Automatically scale the screen to fit the coordinates
+    # Assetto Corsa uses Y as the vertical (height) axis.
+    # For a top-down view we need X (horizontal) and Z (depth) coordinates.
     min_x = min(p.x for p in points)
     max_x = max(p.x for p in points)
-    min_y = min(p.y for p in points)
-    max_y = max(p.y for p in points)
+    min_y = min(p.z for p in points)
+    max_y = max(p.z for p in points)
 
+    # Add a 10% padding so the circuit doesn't touch the window borders
     pad_x = (max_x - min_x) * 0.1
     pad_y = (max_y - min_y) * 0.1
     
@@ -35,12 +39,12 @@ def draw_circuit(points):
     # 4. Start drawing
     pen.penup()
     # Move to the very first point
-    pen.goto(points[0].x, points[0].y)
+    pen.goto(points[0].x, points[0].z)
     pen.pendown()
 
     # Loop through the rest of the points and draw lines between them
     for p in points[1:]:
-        pen.goto(p.x, p.y)
+        pen.goto(p.x, p.z)
 
     print(f"Finished drawing {len(points)} points!")
     
