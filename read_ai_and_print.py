@@ -14,15 +14,11 @@ def draw_circuit(points):
     screen.title("Circuit Test Viewer")
     screen.bgcolor("black")
 
-    # 2. Automatically scale the screen to fit the coordinates
-    # Note: If the circuit looks like a flat line, the top-down view in your game 
-    # might use X and Z instead of X and Y. If so, change p.y to p.z below!
     min_x = min(p.x for p in points)
     max_x = max(p.x for p in points)
     min_y = min(p.y for p in points)
     max_y = max(p.y for p in points)
 
-    # Add a 10% padding so the circuit doesn't touch the window borders
     pad_x = (max_x - min_x) * 0.1
     pad_y = (max_y - min_y) * 0.1
     
