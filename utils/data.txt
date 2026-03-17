@@ -1,0 +1,11 @@
+1) Speed -> Velocita in km/h
+2) Accelerazione -> Accelerazione con gAcc
+3) Turning Rate
+3) Velocita Laterale
+4) Distance to CenterLine
+5) angle to center, l'angolo che la macchina dovrea prendere per tornare al centro
+6) Next Curve Distance, distanza dalla prossima curva
+7) Next Curve Direction con X c {-1, +1} sinistra destra
+
+
+
