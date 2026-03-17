@@ -9,30 +9,32 @@ from torch.distributions import Normal
 import read_ai as fast_lane_api
 
 # --- CONFIGURAZIONE ---
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cuda")
 NUM_INSTANCES = 2048
 LR = 1e-4
 GAMMA = 0.99
 STEPS_PER_EPOCH = 200
 EPOCHS = 5000
 SAVE_PATH = "pilot_model.pth"
-OUT_OF_BOUNDS_DIST = 50.0  # metri oltre i quali si resetta l'istanza
+OUT_OF_BOUNDS_DIST = 50.0  # metri oltre i quali si resetta l'istanza e si prende -8000
 
 print(f"Dispositivo rilevato: {DEVICE} - Istanze parallele: {NUM_INSTANCES}")
 
+
 # --- 1. GENERATORE CIRCUITO (Ora carica i dati reali) ---
-def load_real_track(file_path="fast_lane.ai"):
+def load_real_track(file_path="../files_ai/fast_lane.ai"):
     print(f"Caricamento tracciato da {file_path}...")
     lista_coordinate = fast_lane_api.get_data(file_path)
-    
+
     # Estraiamo x e z, dato che nel tuo script l'angolo usa queste coordinate
     # (ignoriamo y che presumibilmente è l'altitudine)
     points = [[c.x, c.z] for c in lista_coordinate]
-    
+
     # Convertiamo la lista in un tensore PyTorch
     track_tensor = torch.tensor(points, dtype=torch.float32, device=DEVICE)
     print(f"Tracciato caricato con successo: {len(track_tensor)} waypoints.")
     return track_tensor
+
 
 # --- 2. IL CERVELLO (Rete Neurale) ---
 class PilotNet(nn.Module):
@@ -55,6 +57,7 @@ class PilotNet(nn.Module):
     def forward(self, x):
         x = self.common(x)
         return self.actor(x), self.critic(x)
+
 
 # --- 3. AMBIENTE SIMULATO SU GPU ---
 class GPUSimulator:
@@ -117,7 +120,14 @@ class GPUSimulator:
         throttle = actions[:, 0]
         steer = actions[:, 1]
 
-        self.heading += steer * 4.0 * self.dt
+        # Scaliamo lo sterzo da [-1, 1] al range [-pi, +pi]
+        steer_rad = steer * torch.pi
+
+        self.heading += steer_rad * self.dt
+
+        # Normalizziamo l'heading per mantenerlo sempre tra -pi e +pi
+        self.heading = (self.heading + torch.pi) % (2 * torch.pi) - torch.pi
+
         acc_val = throttle * 15.0
 
         self.vel[:, 0] += torch.cos(self.heading) * acc_val * self.dt
@@ -131,18 +141,23 @@ class GPUSimulator:
         self.speed = new_speed
 
         obs, dist_to_center, angle_to_center, nearest_idx = self.get_observation()
+
+        # Gestione dei fuori pista
         out_of_bounds = dist_to_center > OUT_OF_BOUNDS_DIST
+        oob_mask = out_of_bounds.clone()  # Salviamo la maschera per il reward
+
         if out_of_bounds.any():
             self.reset(mask=out_of_bounds)
             obs, dist_to_center, angle_to_center, nearest_idx = self.get_observation()
 
-        return obs, dist_to_center, angle_to_center, nearest_idx
+        return obs, dist_to_center, angle_to_center, nearest_idx, oob_mask
+
 
 # --- 4. CICLO DI ADDESTRAMENTO ---
 def train():
     # Usiamo il nuovo loader invece del generatore matematico
-    track = load_real_track("fast_lane.ai")
-    
+    track = load_real_track("../files_ai/fast_lane.ai")
+
     sim = GPUSimulator(NUM_INSTANCES, track)
     model = PilotNet(input_dim=7).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR)
@@ -180,17 +195,27 @@ def train():
             action = torch.clamp(action, -1.0, 1.0)
             log_prob = dist_policy.log_prob(action).sum(dim=-1)
 
-            next_obs, dist_after, angle_after, next_idx = sim.step(action)
+            # Riceviamo anche la oob_mask
+            next_obs, dist_after, angle_after, next_idx, oob_mask = sim.step(action)
 
             progress = (next_idx.float() - sim.prev_nearest_idx.float()) % sim.n_track
             sim.prev_nearest_idx = next_idx.clone()
 
+            # --- CALCOLO REWARD CORRETTO ---
+            # 1. Base (Premio altissimo per il progresso in avanti)
             reward = (
-                sim.speed / 100.0
-                - dist_after / OUT_OF_BOUNDS_DIST
-                - torch.abs(angle_after) / np.pi
-                + progress * 0.05
+                    sim.speed / 100.0
+                    - dist_after / OUT_OF_BOUNDS_DIST
+                    - torch.abs(angle_after) / np.pi
+                    + progress * 1.0  # <--- Molto aumentato
             )
+
+            # 2. Penalità per la "sindrome del codardo" (se va troppo piano)
+            too_slow_mask = sim.speed < 10.0
+            reward[too_slow_mask] -= 5.0
+
+            # 3. Mega-penalità per i fuori pista
+            reward[oob_mask] = -8000.0
 
             states.append(obs)
             actions.append(action)
@@ -245,6 +270,7 @@ def train():
                 'reward': avg_reward,
                 'noise_std': noise_std,
             }, SAVE_PATH)
+
 
 if __name__ == "__main__":
     try:

@@ -13,7 +13,7 @@ LR = 1e-4
 GAMMA = 0.99
 STEPS_PER_EPOCH = 200
 EPOCHS = 5000
-SAVE_PATH = "pilot_model.pth"
+SAVE_PATH = "../pilot_model.pth"
 OUT_OF_BOUNDS_DIST = 50.0  # metri oltre i quali si resetta l'istanza
 
 print(f"Dispositivo rilevato: {DEVICE} - Istanze parallele: {NUM_INSTANCES}")
@@ -198,12 +198,20 @@ def train():
             progress = (next_idx.float() - sim.prev_nearest_idx.float()) % sim.n_track
             sim.prev_nearest_idx = next_idx.clone()
 
+            # 1. Calcolo del reward base (Ho aumentato il moltiplicatore del progress da 0.05 a 1.0)
             reward = (
-                sim.speed / 100.0                          # velocità (0..~2)
-                - dist_after / OUT_OF_BOUNDS_DIST          # distanza dal centro (0..1)
-                - torch.abs(angle_after) / np.pi           # angolo errato (0..1)
-                + progress * 0.05                          # FIX #12: progresso sul giro
+                    sim.speed / 100.0
+                    - dist_after / OUT_OF_BOUNDS_DIST
+                    - torch.abs(angle_after) / np.pi
+                    + progress * 1.0  # PREMIO PIÙ ALTO PER CHI AVANZA!
             )
+
+            # 2. Penalità per i codardi: se vai a meno di 10 km/h, perdi punti costantemente
+            too_slow_mask = sim.speed < 10.0
+            reward[too_slow_mask] -= 5.0
+
+            # 3. Mega-penalità per i fuori pista
+            reward[oob_mask] = -8000.0
 
             states.append(obs)
             actions.append(action)

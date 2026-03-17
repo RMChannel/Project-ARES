@@ -1,13 +1,19 @@
 import turtle
+import utils.driver as driver
+
 
 # Import the extraction function from your first file 
 # (Make sure the first file is saved as parser.py)
 import read_ai
+rd = driver.reader
+rd.start()
 
 def draw_circuit(points):
     if not points:
         print("No points found to draw.")
         return
+
+
 
     # 1. Setup the Turtle screen
     screen = turtle.Screen()
@@ -29,6 +35,11 @@ def draw_circuit(points):
     # This is the magic command that forces the window to match your custom coordinates
     screen.setworldcoordinates(min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
+    user = turtle.Turtle()
+    user.color("red")
+    user.pensize(2)
+    user.speed("fastest")
+    user.hideturtle()
     # 3. Setup the Turtle pen
     pen = turtle.Turtle()
     pen.speed("fastest") # Maximum drawing speed
@@ -44,6 +55,7 @@ def draw_circuit(points):
 
     # Loop through the rest of the points and draw lines between them
     for p in points[1:]:
+
         pen.goto(p.x, p.z)
 
     print(f"Finished drawing {len(points)} points!")

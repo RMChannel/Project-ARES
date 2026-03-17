@@ -1,0 +1,8 @@
+numpy>=1.21.0
+scipy>=1.7.0
+vgamepad>=0.1.0
+gymnasium>=0.26.0
+stable-baselines3>=2.0.0
+pyautogui>=0.9.50
+torch>=1.12.0
+shimmy>=2.0.0

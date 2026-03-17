@@ -135,9 +135,19 @@ class CheckpointSystem:
         self.last_idx = 0
         self.laps_completed = 0
 
-    def reset(self):
-        """Resetta il tracker a inizio pista."""
-        self.last_idx = 0
+    def reset(self, start_x: float = None, start_z: float = None):
+        """
+        Resetta il tracker.
+        Se start_x e start_z sono forniti, inizializza dal punto più vicino.
+        Altrimenti inizializza dall'inizio della pista.
+        """
+        if start_x is not None and start_z is not None:
+            # Trova il punto più vicino alla posizione di partenza
+            _, nearest_idx = self.kdtree.query([start_x, start_z])
+            self.last_idx = nearest_idx
+            print(f"[CheckpointSystem] Inizializzato da posizione ({start_x:.1f}, {start_z:.1f}) -> Idx {nearest_idx}")
+        else:
+            self.last_idx = 0
         self.laps_completed = 0
 
     def get_ideal_heading(self, nearest_idx: int) -> float:
@@ -158,6 +168,9 @@ class CheckpointSystem:
     def update(self, x: float, z: float) -> dict:
         """
         Aggiorna il tracker con la posizione corrente dell'agente.
+        Cerca il punto più vicino SOLO in una finestra locale attorno a last_idx
+        per seguire il percorso sequenzialmente.
+
         Ritorna un dizionario con:
           - nearest_idx      : indice del punto AI piu' vicino
           - ideal_heading_rad: angolo tangente della AI line al punto corrente (rad)
@@ -167,7 +180,27 @@ class CheckpointSystem:
           - corner_dist_m    : distanza (m) alla prossima curva
           - corner_speed     : velocita' target (km/h) alla curva
         """
-        _, nearest_idx = self.kdtree.query([x, z])
+        # Cerca solo in una finestra locale (±50 punti) attorno a last_idx
+        # per seguire il percorso sequenzialmente
+        search_window = 50
+        n = self.n_points
+
+        # Costruisci la lista di indici da controllare
+        indices = []
+        for offset in range(-search_window, search_window + 1):
+            idx = (self.last_idx + offset) % n
+            indices.append(idx)
+
+        # Trova il punto più vicino nella finestra locale
+        min_dist = float('inf')
+        nearest_idx = self.last_idx
+
+        for idx in indices:
+            px, pz = self.positions_xz[idx]
+            dist = np.sqrt((x - px)**2 + (z - pz)**2)
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = idx
 
         progress_reward   = 0.0
         backtrack_penalty = 0.0
@@ -175,18 +208,24 @@ class CheckpointSystem:
 
         # --- Avanzamento ---
         raw_advance = nearest_idx - self.last_idx
-        if raw_advance < -(self.n_points // 2):
+
+        # Gestisci wrap-around della pista circolare
+        if raw_advance > (self.n_points // 2):
+            raw_advance -= self.n_points
+        elif raw_advance < -(self.n_points // 2):
             raw_advance += self.n_points
 
         if raw_advance > 0:
+            # Progresso in avanti
             progress_reward = raw_advance / self.n_points * 10.0
             prev_cp = self.last_idx // self.CHECKPOINT_STEP
-            curr_cp = (nearest_idx % self.n_points) // self.CHECKPOINT_STEP
+            curr_cp = nearest_idx // self.CHECKPOINT_STEP
             if curr_cp != prev_cp:
                 checkpoint_hit = True
-            self.last_idx = nearest_idx % self.n_points
+            self.last_idx = nearest_idx
 
         elif raw_advance < -self.BACKTRACK_TOLERANCE:
+            # Sta andando indietro
             backtrack_penalty = -2.0 * abs(raw_advance) / self.n_points * 10.0
 
         # --- Heading ideale dalla AI line ---
