@@ -17,9 +17,6 @@ class Cordinates:
     def __str__(self):
         return f"({self.x}||{self.y}||{self.z})||{self.direction}||{self.right_bound}||{self.left_bound}||{self.angle}"
 
-
-
-
 # Initialize accumulators
 def get_data(nome_file):
     dir_real = 0.0
@@ -58,9 +55,46 @@ def get_data(nome_file):
         # le uniche informazioni comprovate sono x,y e z
         lista_coordinate.append(Cordinates(x, y, z, dist, row_id, direction, right_bound, left_bound, angle))
     return lista_coordinate
-        
+
+
+
+def get3d(file,k):
+    lista_coordinate = get_data(file)
+    n = len(lista_coordinate)
+    lista_coordinate_bordi = []
+    for i in range(n):
+
+
+        a : Cordinates = lista_coordinate[i%n]
+        b : Cordinates = lista_coordinate[i+1%n]
+
+        lista_coordinate_bordi.append(calcola_coordinate_rettangolo(a.x,a.z,b.x,b.z,k))
+
+
+
+
+def calcola_coordinate_rettangolo(x_a, y_a, x_b, y_b, k):
+    dx = x_b - x_a
+    dy = y_b - y_a
+    h = math.sqrt(dx ** 2 + dy ** 2)
+
+    #Questo ci sta
+    if h == 0:
+        return "Errore: A e B non possono coincidere."
+
+    xc = x_a - (k / h) * dy
+    yc = y_a + (k / h) * dx
+
+    xd = x_a + (k / h) * dy
+    yd = y_a - (k / h) * dx
+
+    return {
+        "c": (round(xc, 3), round(yc, 3)),
+        "d": (round(xd, 3), round(yd, 3)),
+    }
+
+
+
 
 if __name__ == "__main__":
-    lista_coordinate = get_data("files_ai/fast_lane.ai")
-    for coordinate in lista_coordinate:
-        print(coordinate.__str__())
+    print("god is not with us")
