@@ -1,4 +1,5 @@
 /venv/
+.python-version
 .idea/
 /models/
 /models_sim/
