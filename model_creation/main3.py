@@ -1,3 +1,25 @@
+"""
+main3.py – Ambiente semplificato: Segui la polyline
+====================================================
+Una macchina virtuale (1.5m x 3m) deve imparare a seguire un percorso
+definito da una lista di waypoints modificabili (TRACK_POINTS).
+Ambiente completamente su GPU con PPO mini-batch.
+Visualizzatore Pygame asincrono che mostra i migliori agenti.
+
+Osservazione (7):
+  0  speed_norm           velocità normalizzata (0..~1)
+  1  lateral_offset       offset laterale dalla linea / TRACK_HALF_WIDTH
+  2  heading_error        errore angolare rispetto al segmento / pi
+  3  sin(heading)
+  4  cos(heading)
+  5  lateral_vel          velocità laterale normalizzata
+  6  forward_vel          velocità in avanti normalizzata
+
+Azione (2):
+  0  throttle  [-1, 1]  (negativo = freno)
+  1  steer     [-1, 1]
+"""
+
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -10,84 +32,90 @@ import multiprocessing as mp
 import queue
 from torch.distributions import Normal
 
-import read_ai as fast_lane_api
-
-# --- CONFIGURAZIONE ---
+# ========================= CONFIGURAZIONE =========================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Memory budget (7.6 GB GPU):
-#   rollout buffer = NUM_INSTANCES * STEPS_PER_EPOCH * 12 * 4 bytes
-#   512 * 512 * 12 * 4 = ~12 MB  →  safe; mini-batch PPO keeps gradients small
-NUM_INSTANCES         = 512
-STEPS_PER_EPOCH       = 512
-MINI_BATCH_SIZE       = 4096   # PPO update chunks; adjust down if still OOM
-LR                    = 3e-4
-GAMMA                 = 0.99
-EPS_CLIP              = 0.2
-K_EPOCHS              = 3      # ridotto da 5 per evitare overfitting sul buffer
-EPOCHS                = 10000
-SAVE_PATH             = "pilot_model_v3.pth"
-TRACK_HALF_WIDTH      = 7.0    # metres – allargato da 5.0 per geometria reale
-GRIP_LIMIT_G          = 3.5    # lateral g before understeer penalty
-LAP_COMPLETION_REWARD = 100.0  # reward on crossing the finish line
-MILESTONE_METERS      = 500.0  # bonus intermedio ogni N metri
-MILESTONE_REWARD      = 5.0    # bonus per milestone
-VISUALIZE             = True
-NUM_VIS_AGENTS        = 20
+NUM_INSTANCES     = 512
+STEPS_PER_EPOCH   = 512
+MINI_BATCH_SIZE   = 4096
+LR                = 3e-4
+GAMMA             = 0.99
+EPS_CLIP          = 0.2
+K_EPOCHS          = 3
+EPOCHS            = 10000
+SAVE_PATH         = "pilot_model_v3.pth"
 
-# Metric look-ahead distances (metres)
-LOOKAHEAD_METERS = [10.0, 30.0, 80.0, 150.0]
+# --- Fisiche ---
+CAR_WIDTH         = 1.5    # metri
+CAR_LENGTH        = 3.0    # metri
+TRACK_HALF_WIDTH  = 5.0    # metri – limiti laterali dalla linea
+MAX_SPEED_KMH     = 200.0  # velocità massima raggiungibile
+STEER_RATE        = 3.0    # rad/s a steer=1.0
+MAX_ACCEL         = 12.0   # m/s² accelerazione massima
+MAX_BRAKE         = 10.0   # m/s² frenata massima
+DRAG_COEFF        = 0.005  # attrito aerodinamico
 
-print(f"Dispositivo rilevato: {DEVICE} - Istanze parallele: {NUM_INSTANCES}")
+# ========================= TRACCIATO (MODIFICA QUI) =========================
+# Lista di waypoints [x, y] in metri. Aggiungi/modifica/rimuovi punti a piacere.
+# Il percorso segue i segmenti nell'ordine in cui sono elencati.
+TRACK_POINTS = [
+    [0.0,    0.0],
+    [500.0,  0.0],
+    [1000.0, 0.0],
+    [1500.0, 0.0],
+    [2000.0, 0.0],
+]
 
-
-# ---------------------------------------------------------------------------
-# 1. TRACK LOADING
-# ---------------------------------------------------------------------------
-def load_real_track(file_path="fast_lane.ai"):
-    print(f"Caricamento tracciato da {file_path}...")
-    lista_coordinate = fast_lane_api.get_data(file_path)
-    points = [[c.x, c.z] for c in lista_coordinate]
-    track_tensor = torch.tensor(points, dtype=torch.float32, device=DEVICE)
-    print(f"Tracciato caricato: {len(track_tensor)} waypoints.")
-    return track_tensor
-
-
-def compute_segment_lengths(track):
-    """Cumulative arc-length along the track (cyclic)."""
-    next_p  = torch.roll(track, -1, dims=0)
-    seg_len = torch.norm(next_p - track, dim=1)
-    cum_len = torch.zeros(len(track), device=DEVICE)
-    cum_len[1:] = torch.cumsum(seg_len[:-1], dim=0)
-    return seg_len, cum_len, seg_len.sum()
+# --- Visualizzazione ---
+VISUALIZE         = True
+NUM_VIS_AGENTS    = 5      # top 5 migliori agenti
+NUM_VIS_AGENTS    = 10     # migliori agenti da mostrare
 
 
-# ---------------------------------------------------------------------------
-# 2. NEURAL NETWORK  (input_dim = 12)
-# ---------------------------------------------------------------------------
+# ========================= UTILS TRACCIATO =========================
+def build_track(points_list):
+    """
+    Da una lista di punti crea:
+      - track: (M, 2) tensor dei waypoints
+      - seg_dirs: (M-1, 2) direzioni unitarie dei segmenti
+      - seg_normals: (M-1, 2) normali (perpendicolare sinistra)
+      - seg_headings: (M-1,) heading di ogni segmento
+      - seg_lengths: (M-1,) lunghezza di ogni segmento
+      - cum_lengths: (M-1,) distanza cumulativa fino all'inizio di ogni segmento
+      - total_length: lunghezza totale del percorso
+    """
+    track = torch.tensor(points_list, dtype=torch.float32, device=DEVICE)
+    M = len(track)
+    assert M >= 2, "Servono almeno 2 waypoints"
+
+    diffs = track[1:] - track[:-1]                       # (M-1, 2)
+    seg_lengths = torch.norm(diffs, dim=1)                # (M-1,)
+    seg_dirs    = diffs / seg_lengths.unsqueeze(1)        # (M-1, 2) unitari
+    seg_normals = torch.stack([-seg_dirs[:, 1], seg_dirs[:, 0]], dim=1)  # (M-1, 2)
+    seg_headings = torch.atan2(diffs[:, 1], diffs[:, 0])  # (M-1,)
+
+    cum_lengths = torch.zeros(M - 1, device=DEVICE)
+    cum_lengths[1:] = torch.cumsum(seg_lengths[:-1], dim=0)
+    total_length = seg_lengths.sum().item()
+
+    return track, seg_dirs, seg_normals, seg_headings, seg_lengths, cum_lengths, total_length
+
+
+# ========================= RETE NEURALE =========================
 class PilotNet(nn.Module):
     """
-    Inputs (12):
-      0  speed (normalised)
-      1  lateral_g (clamped, normalised)
-      2  lateral_vel (normalised)
-      3  lateral_offset / TRACK_HALF_WIDTH  → [-1, 1]
-      4  heading_error / pi
-      5  sin(heading)
-      6  cos(heading)
-      7-10  curvature look-aheads at 10/30/80/150 m
-      11 time_since_grip_event (normalised, clamped)
+    Input: 7, Hidden: 128→128→64, Actor: Tanh + learnable log_std, Critic: lineare
     """
-    def __init__(self, input_dim=12):
+    def __init__(self, input_dim=7):
         super().__init__()
         self.common = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.ReLU(),
-            nn.Linear(256, 256),       nn.ReLU(),
-            nn.Linear(256, 128),       nn.ReLU(),
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Linear(128, 128),       nn.ReLU(),
+            nn.Linear(128, 64),        nn.ReLU(),
         )
-        self.actor_mean    = nn.Sequential(nn.Linear(128, 2), nn.Tanh())
-        self.actor_log_std = nn.Parameter(torch.zeros(2))  # learnable std
-        self.critic        = nn.Linear(128, 1)
+        self.actor_mean    = nn.Sequential(nn.Linear(64, 2), nn.Tanh())
+        self.actor_log_std = nn.Parameter(torch.zeros(2))
+        self.critic        = nn.Linear(64, 1)
 
     def forward(self, x):
         feat = self.common(x)
@@ -110,275 +138,411 @@ class PilotNet(nn.Module):
         return logprobs, value, entropy
 
 
-# ---------------------------------------------------------------------------
-# 3. GPU SIMULATOR
-# ---------------------------------------------------------------------------
+# ========================= SIMULATORE GPU =========================
 class GPUSimulator:
-    def __init__(self, num_instances, track):
-        self.N       = num_instances
-        self.track   = track
-        self.n_track = len(track)
-        self.dt      = 1.0 / 30.0
+    """
+    Simula N macchine in parallelo su GPU.
+    Il percorso è una polyline definita da TRACK_POINTS.
+    Ogni agente sa su quale segmento si trova; osservazioni e reward
+    sono calcolati rispetto al segmento più vicino.
+    """
+    def __init__(self, num_instances, track_data):
+        self.N = num_instances
+        self.dt = 1.0 / 30.0  # 30 Hz
 
-        next_p = torch.roll(track, -1, dims=0)
-        diff   = next_p - track
-        self.track_headings          = torch.atan2(diff[:, 1], diff[:, 0])
-        self.seg_len, self.cum_len, self.total_len = compute_segment_lengths(track)
-        self.avg_seg = (self.total_len / self.n_track).item()
+        (self.track, self.seg_dirs, self.seg_normals,
+         self.seg_headings, self.seg_lengths,
+         self.cum_lengths, self.total_length) = track_data
 
-        # Curriculum spawn: fraction of track to spawn on (0.2 → 1.0)
-        self.spawn_fraction = 0.2
+        self.n_segments = len(self.seg_lengths)
+
+        # Reward tracking cumulativo per ogni agente
+        self.cumulative_reward = torch.zeros(num_instances, device=DEVICE)
 
         self.reset()
 
-    # ------------------------------------------------------------------
+    def _find_nearest_segment(self):
+        """
+        Per ogni agente trova il segmento più vicino e la proiezione su esso.
+        Ritorna: seg_idx, lateral_offset (con segno), forward_on_seg (0..seg_len)
+        """
+        N = self.N
+        S = self.n_segments
+
+        # Vettore da ogni inizio-segmento ad ogni agente: (N, S, 2)
+        starts = self.track[:-1]                     # (S, 2)
+        to_car = self.pos.unsqueeze(1) - starts.unsqueeze(0)  # (N, S, 2)
+
+        # Proiezione sul segmento
+        dirs = self.seg_dirs.unsqueeze(0)            # (1, S, 2)
+        forward_proj = (to_car * dirs).sum(dim=2)    # (N, S)
+        forward_proj_clamped = torch.maximum(forward_proj, torch.zeros_like(forward_proj))
+        forward_proj_clamped = torch.minimum(forward_proj_clamped, self.seg_lengths.unsqueeze(0))
+
+        # Punto più vicino su ogni segmento
+        closest = starts.unsqueeze(0) + forward_proj_clamped.unsqueeze(2) * dirs  # (N, S, 2)
+        dist_sq = ((self.pos.unsqueeze(1) - closest) ** 2).sum(dim=2)  # (N, S)
+
+        # Segmento con distanza minima
+        seg_idx = dist_sq.argmin(dim=1)              # (N,)
+
+        # Raccogli i valori dal segmento scelto
+        batch_idx = torch.arange(N, device=DEVICE)
+        forward_on_seg = forward_proj_clamped[batch_idx, seg_idx]
+
+        # Offset laterale con segno
+        normals = self.seg_normals[seg_idx]           # (N, 2)
+        to_car_on_seg = to_car[batch_idx, seg_idx]    # (N, 2)
+        lateral_offset = (to_car_on_seg * normals).sum(dim=1)  # (N,)
+
+        return seg_idx, lateral_offset, forward_on_seg
+
     def reset(self, mask=None):
-        """Random start positions – curriculum: only on first spawn_fraction of track."""
-        max_wp = max(1, int(self.n_track * self.spawn_fraction))
+        """Spawn: posizioni casuali lungo il primo 20% del percorso."""
         if mask is None:
-            n   = self.N
-            idx = torch.randint(0, max_wp, (n,), device=DEVICE)
+            n = self.N
         else:
-            n   = int(mask.sum().item())
-            idx = torch.randint(0, max_wp, (n,), device=DEVICE)
+            n = int(mask.sum().item())
 
-        pos     = self.track[idx]
-        heading = self.track_headings[idx]
-        vel     = torch.zeros((n, 2), device=DEVICE)
-        speed_init       = torch.rand(n, device=DEVICE) * 30.0  # 0-30 km/h
-        vel[:, 0]        = torch.cos(heading) * speed_init / 3.6
-        vel[:, 1]        = torch.sin(heading) * speed_init / 3.6
+        # Sceglie una posizione casuale lungo il percorso (primi 20%)
+        max_dist = self.total_length * 0.2
+        t = torch.rand(n, device=DEVICE) * max_dist  # distanza dall'inizio
+
+        # Trova il segmento corrispondente
+        seg_idx = torch.zeros(n, dtype=torch.long, device=DEVICE)
+        for i in range(self.n_segments - 1):
+            seg_idx = torch.where(t >= self.cum_lengths[i + 1], 
+                                  torch.tensor(i + 1, device=DEVICE), seg_idx)
+        local_t = t - self.cum_lengths[seg_idx]
+
+        # Posizione
+        starts = self.track[:-1][seg_idx]       # (n, 2)
+        dirs   = self.seg_dirs[seg_idx]         # (n, 2)
+        pos    = starts + local_t.unsqueeze(1) * dirs
+
+        # Heading allineato al segmento + piccola perturbazione
+        heading = self.seg_headings[seg_idx]
+        heading = heading + (torch.rand(n, device=DEVICE) - 0.5) * 0.3
+
+        # Velocità iniziale
+        speed_init = torch.rand(n, device=DEVICE) * 10.0  # 0-10 m/s
+        vel = torch.zeros((n, 2), device=DEVICE)
+        vel[:, 0] = torch.cos(heading) * speed_init
+        vel[:, 1] = torch.sin(heading) * speed_init
 
         if mask is None:
-            self.pos              = pos
-            self.heading          = heading
-            self.vel              = vel
-            self.speed            = speed_init
-            self.prev_nearest_idx = idx.clone()
-            self.accel_g          = torch.zeros(n, device=DEVICE)
-            self.time_since_grip  = torch.zeros(n, device=DEVICE)
-            self.cumulative_progress = torch.zeros(n, device=DEVICE)
-            self.milestone_count     = torch.zeros(n, dtype=torch.long, device=DEVICE)
+            self.pos     = pos
+            self.heading = heading
+            self.vel     = vel
+            self.speed   = speed_init * 3.6
+            self.cumulative_reward = torch.zeros(n, device=DEVICE)
         else:
-            self.pos[mask]              = pos
-            self.heading[mask]          = heading
-            self.vel[mask]              = vel
-            self.speed[mask]            = speed_init
-            self.prev_nearest_idx[mask] = idx
-            self.accel_g[mask]          = 0.0
-            self.time_since_grip[mask]  = 0.0
-            self.cumulative_progress[mask] = 0.0
-            self.milestone_count[mask]     = 0
+            self.pos[mask]     = pos
+            self.heading[mask] = heading
+            self.vel[mask]     = vel
+            self.speed[mask]   = speed_init * 3.6
+            self.cumulative_reward[mask] = 0.0
 
-    # ------------------------------------------------------------------
-    def _metric_lookahead_curvature(self, nearest_idx):
-        ideal_h    = self.track_headings[nearest_idx]
-        curvatures = []
-        for dist_m in LOOKAHEAD_METERS:
-            wp_offset = max(1, int(dist_m / self.avg_seg))
-            f_idx = (nearest_idx + wp_offset) % self.n_track
-            f_h   = self.track_headings[f_idx]
-            curv  = (f_h - ideal_h + np.pi) % (2 * np.pi) - np.pi
-            curvatures.append(curv / np.pi)
-        return torch.stack(curvatures, dim=1)  # (N, 4)
-
-    # ------------------------------------------------------------------
     def get_observation(self):
-        dists = torch.cdist(self.pos, self.track)
-        dist_to_center, nearest_idx = torch.min(dists, dim=1)
+        seg_idx, lat_offset, fwd_on_seg = self._find_nearest_segment()
 
-        ideal_h     = self.track_headings[nearest_idx]
-        heading_err = (ideal_h - self.heading + np.pi) % (2 * np.pi) - np.pi
+        # Heading error rispetto al segmento corrente
+        ideal_heading = self.seg_headings[seg_idx]
+        heading_err = ideal_heading - self.heading
+        heading_err = (heading_err + np.pi) % (2 * np.pi) - np.pi
 
-        side_x  = -torch.sin(self.heading)
-        side_y  =  torch.cos(self.heading)
-        lat_vel = self.vel[:, 0] * side_x + self.vel[:, 1] * side_y
+        # Velocità proiettata sul segmento
+        dirs = self.seg_dirs[seg_idx]
+        normals = self.seg_normals[seg_idx]
+        forward_vel = (self.vel * dirs).sum(dim=1)
+        lateral_vel = (self.vel * normals).sum(dim=1)
 
-        lat_sign   = torch.sign(
-            (self.pos[:, 0] - self.track[nearest_idx, 0]) * side_x +
-            (self.pos[:, 1] - self.track[nearest_idx, 1]) * side_y
-        )
-        lat_offset = lat_sign * dist_to_center / TRACK_HALF_WIDTH
+        obs = torch.stack([
+            self.speed / MAX_SPEED_KMH,                          # [0]
+            (lat_offset / TRACK_HALF_WIDTH).clamp(-1.5, 1.5),   # [1]
+            heading_err / np.pi,                                  # [2]
+            torch.sin(self.heading),                              # [3]
+            torch.cos(self.heading),                              # [4]
+            lateral_vel * 0.05,                                   # [5]
+            forward_vel * 0.05,                                   # [6]
+        ], dim=1)
 
-        curvatures = self._metric_lookahead_curvature(nearest_idx)
+        return obs, seg_idx, lat_offset, fwd_on_seg, heading_err
 
-        obs = torch.cat([
-            (self.speed * 0.005).unsqueeze(1),
-            self.accel_g.unsqueeze(1).clamp(-3, 3) / 3.0,
-            (lat_vel * 0.05).unsqueeze(1),
-            lat_offset.unsqueeze(1).clamp(-1.5, 1.5),
-            (heading_err / np.pi).unsqueeze(1),
-            torch.sin(self.heading).unsqueeze(1),
-            torch.cos(self.heading).unsqueeze(1),
-            curvatures,
-            (self.time_since_grip * 0.1).unsqueeze(1).clamp(0, 1),
-        ], dim=1)  # (N, 12)
+    def _get_total_progress(self, seg_idx, fwd_on_seg):
+        """Progresso totale lungo il percorso in metri."""
+        return self.cum_lengths[seg_idx] + fwd_on_seg
 
-        return obs, dist_to_center, heading_err, nearest_idx
-
-    # ------------------------------------------------------------------
     def step_with_reward(self, actions):
-        throttle = actions[:, 0]
-        steer    = actions[:, 1]
+        throttle = actions[:, 0].clamp(-1, 1)
+        steer    = actions[:, 1].clamp(-1, 1)
 
-        # Heading
-        self.heading += steer * 4.5 * self.dt
+        # --- Heading ---
+        self.heading += steer * STEER_RATE * self.dt
         self.heading  = (self.heading + np.pi) % (2 * np.pi) - np.pi
 
-        # Longitudinal
-        acc_val = torch.where(throttle >= 0, throttle * 18.0, throttle * 12.0)
-        self.vel[:, 0] += torch.cos(self.heading) * acc_val * self.dt
-        self.vel[:, 1] += torch.sin(self.heading) * acc_val * self.dt
+        # --- Accelerazione ---
+        accel = torch.where(throttle >= 0,
+                            throttle * MAX_ACCEL,
+                            throttle * MAX_BRAKE)
+        self.vel[:, 0] += torch.cos(self.heading) * accel * self.dt
+        self.vel[:, 1] += torch.sin(self.heading) * accel * self.dt
 
-        # Grip model
-        heading_rate  = steer * 4.5
-        lat_accel     = heading_rate * (self.speed / 3.6).clamp(min=0)
-        lat_g         = (lat_accel / 9.81).abs()
-        grip_exceeded = lat_g > GRIP_LIMIT_G
-        self.vel[grip_exceeded] *= 0.85
-        self.time_since_grip[grip_exceeded]  = 0.0
-        self.time_since_grip[~grip_exceeded] += self.dt
+        # --- Drag ---
+        speed_ms = torch.norm(self.vel, dim=1)
+        drag_force = DRAG_COEFF * speed_ms
+        drag_decel = torch.where(speed_ms > 0.1,
+                                 drag_force / speed_ms.clamp(min=0.1),
+                                 torch.zeros_like(speed_ms))
+        self.vel *= (1.0 - drag_decel * self.dt).unsqueeze(1).clamp(min=0)
 
-        # Drag
-        drag = 0.985 - (self.speed * 0.00005).clamp(0, 0.02)
-        self.vel *= drag.unsqueeze(1)
+        # --- Posizione ---
         self.pos += self.vel * self.dt
+        self.speed = torch.norm(self.vel, dim=1) * 3.6
 
-        new_speed    = torch.norm(self.vel, dim=1) * 3.6
-        self.accel_g = (new_speed - self.speed) / (self.dt * 9.81)
-        self.speed   = new_speed
+        # --- Osservazione ---
+        obs, seg_idx, lat_offset, fwd_on_seg, heading_err = self.get_observation()
 
-        obs, dist_to_center, heading_err, nearest_idx = self.get_observation()
+        # --- Progresso totale ---
+        total_progress = self._get_total_progress(seg_idx, fwd_on_seg)
 
-        # Metric progress (handles lap wrap-around)
-        cur_dist  = self.cum_len[nearest_idx]
-        prev_dist = self.cum_len[self.prev_nearest_idx]
-        raw_delta = cur_dist - prev_dist
-        delta = torch.where(
-            raw_delta < -self.total_len * 0.4, raw_delta + self.total_len,
-            torch.where(raw_delta > self.total_len * 0.4,
-                        raw_delta - self.total_len, raw_delta)
-        )
+        # Velocità in avanti lungo il segmento
+        dirs = self.seg_dirs[seg_idx]
+        forward_vel = (self.vel * dirs).sum(dim=1)
 
-        # Lap completion bonus
-        lap_bonus = torch.zeros(self.N, device=DEVICE)
-        crossed   = (self.cum_len[self.prev_nearest_idx] > self.total_len * 0.9) & \
-                    (cur_dist < self.total_len * 0.1)
-        lap_bonus[crossed] = LAP_COMPLETION_REWARD
+        # --- Terminazione ---
+        out_of_bounds = lat_offset.abs() > TRACK_HALF_WIDTH
+        past_end   = total_progress > self.total_length - 1.0
+        behind_start = total_progress < -10.0
+        dones = out_of_bounds | past_end | behind_start
 
-        # Milestone bonus: +MILESTONE_REWARD every MILESTONE_METERS of cumulative progress
-        self.cumulative_progress += delta.clamp(min=0)
-        new_milestone_count = (self.cumulative_progress / MILESTONE_METERS).long()
-        milestone_bonus = (new_milestone_count - self.milestone_count).clamp(min=0).float() * MILESTONE_REWARD
-        self.milestone_count = torch.max(self.milestone_count, new_milestone_count)
+        # --- Reward ---
+        speed_reward    = (forward_vel * 3.6 / MAX_SPEED_KMH).clamp(-0.5, 1.0)
+        dist_penalty    = -(lat_offset.abs() / TRACK_HALF_WIDTH).clamp(0, 1) * 0.5
+        heading_penalty = -(heading_err.abs() / np.pi) * 0.3
 
-        self.prev_nearest_idx = nearest_idx.clone()
+        reward = speed_reward + dist_penalty + heading_penalty
+        reward[past_end]      += 50.0
+        reward[out_of_bounds] -= 5.0
+        reward[behind_start]  -= 5.0
 
-        # Termination
-        out_of_bounds = dist_to_center > TRACK_HALF_WIDTH
-        dones = out_of_bounds.clone()
-        if out_of_bounds.any():
-            self.reset(mask=out_of_bounds)
-            obs_reset, _, _, _ = self.get_observation()
-            obs[out_of_bounds] = obs_reset[out_of_bounds]
+        # Accumula reward per ranking
+        self.cumulative_reward += reward
 
-        # Reward — denser signal
-        fwd_x    = torch.cos(self.track_headings[nearest_idx])
-        fwd_y    = torch.sin(self.track_headings[nearest_idx])
-        tang_vel = (self.vel[:, 0] * fwd_x + self.vel[:, 1] * fwd_y) * 3.6
+        # --- Reset agenti morti ---
+        if dones.any():
+            self.reset(mask=dones)
+            obs_new, _, _, _, _ = self.get_observation()
+            obs[dones] = obs_new[dones]
 
-        reward = (
-            tang_vel / 100.0                                           # doubled from /200
-            + delta.clamp(min=0) * 0.10                                # doubled from 0.05
-            + lap_bonus
-            + milestone_bonus                                          # NEW: intermedio
-            - (dist_to_center / TRACK_HALF_WIDTH).clamp(0, 1) * 0.3
-            - grip_exceeded.float() * 0.2
-        )
-        reward[dones] -= 15.0
+        # --- Metriche ---
+        self._last_lat_dist    = lat_offset.abs()
+        self._last_progress    = total_progress
+        self._last_past_end    = past_end
 
-        # Store per-step metrics for logging
-        self._last_grip_exceeded = grip_exceeded
-        self._last_lap_crossed   = crossed
-        self._last_dist          = dist_to_center
+        return obs, dones, reward
 
-        return obs, dist_to_center, heading_err, nearest_idx, dones, reward
+    def get_best_agent_indices(self, n=10):
+        """Ritorna gli indici degli N agenti con reward cumulativo più alto."""
+        n = min(n, self.N)
+        _, indices = torch.topk(self.cumulative_reward, n)
+        return indices
 
 
-# ---------------------------------------------------------------------------
-# 4. ASYNC VISUALIZER
-# ---------------------------------------------------------------------------
-def render_worker(track_points, pos_queue, num_agents):
-    import turtle
-    screen = turtle.Screen()
-    screen.title("Project ARES - Training Visualizer")
-    screen.bgcolor("black")
-    screen.tracer(0, 0)
+# ========================= PYGAME VISUALIZER =========================
+def pygame_render_worker(track_points_np, half_width, data_queue, num_vis):
+    """Processo separato: visualizza il tracciato e i migliori agenti con Pygame."""
+    import pygame
 
-    min_x, min_z = track_points.min(axis=0)
-    max_x, max_z = track_points.max(axis=0)
-    pad_x = (max_x - min_x) * 0.1
-    pad_z = (max_z - min_z) * 0.1
-    screen.setworldcoordinates(min_x - pad_x, min_z - pad_z, max_x + pad_x, max_z + pad_z)
+    pygame.init()
+    WIDTH, HEIGHT = 1200, 600
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Project ARES – Best Agents Visualizer")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("monospace", 14)
+    big_font = pygame.font.SysFont("monospace", 18, bold=True)
 
-    pen = turtle.Turtle()
-    pen.speed("fastest"); pen.color("cyan"); pen.pensize(2); pen.hideturtle()
-    pen.penup(); pen.goto(track_points[0][0], track_points[0][1]); pen.pendown()
-    for p in track_points[1:]:
-        pen.goto(p[0], p[1])
-    pen.goto(track_points[0][0], track_points[0][1])
+    # --- Camera: calcola bounds del tracciato ---
+    tp = track_points_np
+    min_x, min_y = tp.min(axis=0) - half_width * 2
+    max_x, max_y = tp.max(axis=0) + half_width * 2
 
-    colors  = ["red", "green", "blue", "yellow", "magenta", "white"]
-    agents  = []
-    for i in range(num_agents):
-        t = turtle.Turtle()
-        t.shape("circle"); t.shapesize(0.3)
-        t.color(colors[i % len(colors)]); t.penup()
-        agents.append(t)
+    # Assicura un'area minima visibile
+    range_x = max(max_x - min_x, 100)
+    range_y = max(max_y - min_y, 50)
 
-    screen.update()
-    while True:
+    # Scala per fittare la finestra con margini
+    margin = 60
+    scale_x = (WIDTH - 2 * margin) / range_x
+    scale_y = (HEIGHT - 2 * margin) / range_y
+    scale = min(scale_x, scale_y)
+
+    # Centro
+    cx = (min_x + max_x) / 2
+    cy = (min_y + max_y) / 2
+
+    def world_to_screen(wx, wy):
+        sx = int(margin + (wx - min_x) * scale)
+        sy = int(HEIGHT - margin - (wy - min_y) * scale)
+        return sx, sy
+
+    # Colori agenti
+    agent_colors = [
+        (0, 255, 100),    # verde brillante (best)
+        (255, 255, 0),    # giallo
+        (255, 100, 255),  # magenta
+        (0, 200, 255),    # ciano
+        (255, 150, 0),    # arancio
+        (255, 80, 80),    # rosso chiaro
+        (150, 255, 150),  # verde chiaro
+        (200, 200, 255),  # blu chiaro
+        (255, 200, 100),  # pesca
+        (200, 100, 255),  # viola
+    ]
+
+    # Pre-calcola punti del tracciato in screen coords
+    track_screen = [world_to_screen(p[0], p[1]) for p in tp]
+
+    # Bordi (offset perpendicolare)
+    border_left  = []
+    border_right = []
+    for i in range(len(tp) - 1):
+        dx = tp[i+1][0] - tp[i][0]
+        dy = tp[i+1][1] - tp[i][1]
+        length = max(np.sqrt(dx*dx + dy*dy), 0.001)
+        nx, ny = -dy / length, dx / length
+        for t_val in [0.0, 1.0]:
+            px = tp[i][0] + t_val * dx
+            py = tp[i][1] + t_val * dy
+            border_left.append(world_to_screen(px + nx * half_width,
+                                               py + ny * half_width))
+            border_right.append(world_to_screen(px - nx * half_width,
+                                                py - ny * half_width))
+
+    # Stato
+    latest_data = None
+    epoch_info = ""
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+
+        # Leggi ultimo dato dalla coda
         try:
-            pos_np = None
-            while not pos_queue.empty():
-                pos_np = pos_queue.get_nowait()
-            if pos_np is not None:
-                for i in range(num_agents):
-                    agents[i].goto(pos_np[i][0], pos_np[i][1])
-                screen.update()
-            else:
-                time.sleep(0.01)
-                screen.update()
+            while not data_queue.empty():
+                latest_data = data_queue.get_nowait()
         except queue.Empty:
             pass
-        except Exception:
-            break
+
+        # --- RENDER ---
+        screen.fill((15, 15, 25))
+
+        # Griglia sottile
+        grid_color = (30, 30, 45)
+        for gx in range(int(min_x), int(max_x) + 1, max(1, int(range_x / 10))):
+            sx, _ = world_to_screen(gx, 0)
+            pygame.draw.line(screen, grid_color, (sx, 0), (sx, HEIGHT), 1)
+        for gy in range(int(min_y), int(max_y) + 1, max(1, int(range_y / 10))):
+            _, sy = world_to_screen(0, gy)
+            pygame.draw.line(screen, grid_color, (0, sy), (WIDTH, sy), 1)
+
+        # Bordi della pista (rosso scuro)
+        if len(border_left) > 1:
+            pygame.draw.lines(screen, (120, 30, 30), False, border_left, 2)
+            pygame.draw.lines(screen, (120, 30, 30), False, border_right, 2)
+
+        # Linea centrale (ciano)
+        if len(track_screen) > 1:
+            pygame.draw.lines(screen, (0, 180, 220), False, track_screen, 3)
+
+        # Waypoints
+        for i, sp in enumerate(track_screen):
+            pygame.draw.circle(screen, (0, 220, 255), sp, 5)
+            label = font.render(f"{i}", True, (100, 100, 130))
+            screen.blit(label, (sp[0] + 8, sp[1] - 8))
+
+        # Agenti
+        if latest_data is not None:
+            positions, headings, speeds, rewards, epoch_info = latest_data
+
+            for i in range(len(positions)):
+                px, py = positions[i]
+                sx, sy = world_to_screen(px, py)
+                heading = headings[i]
+                spd = speeds[i]
+                rew = rewards[i]
+                color = agent_colors[i % len(agent_colors)]
+
+                # Corpo auto (rettangolo ruotato)
+                car_half_l = CAR_LENGTH * scale / 2
+                car_half_w = CAR_WIDTH * scale / 2
+                cos_h, sin_h = np.cos(-heading), np.sin(-heading)  # -heading per screen Y flip
+
+                corners = []
+                for dx, dy in [(-car_half_l, -car_half_w),
+                               ( car_half_l, -car_half_w),
+                               ( car_half_l,  car_half_w),
+                               (-car_half_l,  car_half_w)]:
+                    rx = dx * cos_h - dy * sin_h
+                    ry = dx * sin_h + dy * cos_h
+                    corners.append((int(sx + rx), int(sy + ry)))
+                pygame.draw.polygon(screen, color, corners, 2)
+
+                # Freccia direzione
+                arrow_len = 15
+                ax = sx + arrow_len * np.cos(-heading)
+                ay = sy + arrow_len * np.sin(-heading)
+                pygame.draw.line(screen, color, (sx, sy), (int(ax), int(ay)), 2)
+
+                # Label
+                label = font.render(f"#{i+1} {spd:.0f}km/h R:{rew:.1f}", True, color)
+                screen.blit(label, (sx + 12, sy - 12))
+
+        # HUD
+        title = big_font.render("PROJECT ARES – Best Agents", True, (0, 220, 255))
+        screen.blit(title, (10, 10))
+        if epoch_info:
+            info_surf = font.render(epoch_info, True, (180, 180, 200))
+            screen.blit(info_surf, (10, 35))
+
+        pygame.display.flip()
+        clock.tick(30)
+
+    pygame.quit()
 
 
-class AsyncVisualizer:
-    def __init__(self, track_tensor, num_agents=20):
-        self.num_agents = min(num_agents, NUM_INSTANCES)
-        self.pos_queue  = mp.Queue(maxsize=3)
-        self.process    = mp.Process(
-            target=render_worker,
-            args=(track_tensor.cpu().numpy(), self.pos_queue, self.num_agents),
+class AsyncPygameVisualizer:
+    def __init__(self, track_points_np, num_vis=10):
+        self.num_vis = num_vis
+        self.data_queue = mp.Queue(maxsize=3)
+        self.process = mp.Process(
+            target=pygame_render_worker,
+            args=(track_points_np, TRACK_HALF_WIDTH,
+                  self.data_queue, self.num_vis),
             daemon=True,
         )
         self.process.start()
 
-    def update(self, agent_positions):
+    def update(self, sim, epoch_info_str=""):
+        """Invia le posizioni dei migliori agenti al visualizzatore."""
+        best_idx = sim.get_best_agent_indices(self.num_vis)
+        positions = sim.pos[best_idx].detach().cpu().numpy()
+        headings  = sim.heading[best_idx].detach().cpu().numpy()
+        speeds    = sim.speed[best_idx].detach().cpu().numpy()
+        rewards   = sim.cumulative_reward[best_idx].detach().cpu().numpy()
+
         try:
-            self.pos_queue.put_nowait(
-                agent_positions[:self.num_agents].detach().cpu().numpy()
+            self.data_queue.put_nowait(
+                (positions, headings, speeds, rewards, epoch_info_str)
             )
         except queue.Full:
             pass
 
 
-# ---------------------------------------------------------------------------
-# 5. ROLLOUT HELPER
-# ---------------------------------------------------------------------------
-def _rollout(sim, model, visualizer, steps):
+# ========================= ROLLOUT =========================
+def _rollout(sim, model, visualizer, steps, epoch_info=""):
     memory_states    = []
     memory_actions   = []
     memory_logprobs  = []
@@ -387,21 +551,20 @@ def _rollout(sim, model, visualizer, steps):
     memory_values    = []
     epoch_reward     = 0.0
 
-    # Accumulatori per metriche
-    total_grip_count = 0
-    total_lap_count  = 0
     total_dist_sum   = 0.0
+    total_fwd_sum    = 0.0
+    total_completed  = 0
     total_steps_n    = 0
 
     model.eval()
     with torch.no_grad():
         for step in range(steps):
-            obs, _, _, _ = sim.get_observation()
+            obs, _, _, _, _ = sim.get_observation()
             action, logprob, value = model.act(obs)
-            _, _, _, _, dones, reward = sim.step_with_reward(action)
+            _, dones, reward = sim.step_with_reward(action)
 
-            if visualizer and step % 10 == 0:
-                visualizer.update(sim.pos)
+            if visualizer and step % 5 == 0:
+                visualizer.update(sim, epoch_info)
 
             memory_states.append(obs)
             memory_actions.append(action)
@@ -411,16 +574,15 @@ def _rollout(sim, model, visualizer, steps):
             memory_values.append(value.squeeze())
             epoch_reward += reward.mean().item()
 
-            # Accumula metriche
-            total_grip_count += sim._last_grip_exceeded.sum().item()
-            total_lap_count  += sim._last_lap_crossed.sum().item()
-            total_dist_sum   += sim._last_dist.mean().item()
-            total_steps_n    += 1
+            total_dist_sum  += sim._last_lat_dist.mean().item()
+            total_fwd_sum   += sim._last_progress.mean().item()
+            total_completed += sim._last_past_end.sum().item()
+            total_steps_n   += 1
 
     metrics = {
-        'avg_dist':  total_dist_sum / max(total_steps_n, 1),
-        'lap_count': int(total_lap_count),
-        'grip_pct':  100.0 * total_grip_count / max(total_steps_n * sim.N, 1),
+        'avg_lat_dist': total_dist_sum / max(total_steps_n, 1),
+        'avg_fwd':      total_fwd_sum / max(total_steps_n, 1),
+        'completed':    int(total_completed),
     }
 
     return (memory_states, memory_actions, memory_logprobs,
@@ -428,18 +590,22 @@ def _rollout(sim, model, visualizer, steps):
             epoch_reward, metrics)
 
 
-# ---------------------------------------------------------------------------
-# 6. TRAINING LOOP
-# ---------------------------------------------------------------------------
+# ========================= TRAINING =========================
 def train():
-    track = load_real_track("../files_ai/fast_lane.ai")
-    sim   = GPUSimulator(NUM_INSTANCES, track)
-    model = PilotNet(input_dim=12).to(DEVICE)
+    track_data = build_track(TRACK_POINTS)
+    total_length = track_data[-1]
+
+    print(f"Tracciato: {len(TRACK_POINTS)} waypoints, {total_length:.0f}m totali")
+    print(f"Waypoints: {TRACK_POINTS}")
+
+    sim   = GPUSimulator(NUM_INSTANCES, track_data)
+    model = PilotNet(input_dim=7).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR)
 
     visualizer = None
     if VISUALIZE:
-        visualizer = AsyncVisualizer(track, num_agents=NUM_VIS_AGENTS)
+        track_np = np.array(TRACK_POINTS, dtype=np.float32)
+        visualizer = AsyncPygameVisualizer(track_np, num_vis=NUM_VIS_AGENTS)
 
     start_epoch = 0
     if os.path.exists(SAVE_PATH):
@@ -454,49 +620,50 @@ def train():
                 model.load_state_dict(ckpt)
                 print("Modello legacy caricato.")
         except Exception as e:
-            print(f"Errore caricamento checkpoint: {e}. Inizio da zero.")
+            print(f"Errore caricamento: {e}. Inizio da zero.")
 
     sim.reset()
 
     for epoch in range(start_epoch, EPOCHS):
-        # --- Curriculum spawn: expand spawn zone over first 500 epochs ---
-        if epoch < 500:
-            sim.spawn_fraction = 0.2 + 0.8 * (epoch / 500.0)
-        else:
-            sim.spawn_fraction = 1.0
+        # Reset cumulative reward per ranking a inizio epoca
+        sim.cumulative_reward.zero_()
 
-        # --- Collect experience ---
+        # --- Epoch info string per il visualizzatore ---
+        epoch_info = f"Epoca {epoch}"
+
+        # --- Rollout ---
         (memory_states, memory_actions, memory_logprobs,
          memory_rewards, memory_terminals, memory_values,
-         epoch_reward, metrics) = _rollout(sim, model, visualizer, STEPS_PER_EPOCH)
+         epoch_reward, metrics) = _rollout(sim, model, visualizer,
+                                           STEPS_PER_EPOCH, epoch_info)
 
-        # --- Adaptive entropy coefficient ---
+        # --- Adaptive entropy ---
         cur_std = model.actor_log_std.exp().mean().item()
         if cur_std > 0.5:
-            ent_coef = 0.005    # forza convergenza
+            ent_coef = 0.005
         elif cur_std < 0.15:
-            ent_coef = 0.02     # previeni premature convergence
+            ent_coef = 0.02
         else:
-            ent_coef = 0.01     # zona buona
+            ent_coef = 0.01
 
         # --- Discounted returns ---
-        returns           = []
+        returns = []
         discounted_reward = torch.zeros(NUM_INSTANCES, device=DEVICE)
         for r, d in zip(reversed(memory_rewards), reversed(memory_terminals)):
             discounted_reward = r + GAMMA * discounted_reward * (~d).float()
             returns.insert(0, discounted_reward)
 
-        returns      = torch.stack(returns).detach()                    # (T, N)
-        old_states   = torch.stack(memory_states).detach().view(-1, 12) # (T*N, 12)
-        old_actions  = torch.stack(memory_actions).detach().view(-1, 2) # (T*N, 2)
-        old_logprobs = torch.stack(memory_logprobs).detach().view(-1)   # (T*N,)
-        old_values   = torch.stack(memory_values).detach().view(-1)     # (T*N,)
+        returns      = torch.stack(returns).detach()
+        old_states   = torch.stack(memory_states).detach().view(-1, 7)
+        old_actions  = torch.stack(memory_actions).detach().view(-1, 2)
+        old_logprobs = torch.stack(memory_logprobs).detach().view(-1)
+        old_values   = torch.stack(memory_values).detach().view(-1)
 
         advantages = returns.view(-1) - old_values
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # --- Mini-batch PPO update ---
-        n_total    = old_states.shape[0]
+        # --- PPO Update ---
+        n_total = old_states.shape[0]
         model.train()
         total_loss = 0.0
         n_updates  = 0
@@ -518,7 +685,7 @@ def train():
                     -torch.min(surr1, surr2)
                     + 0.5 * nn.MSELoss()(state_values.squeeze(),
                                          returns.view(-1)[idx])
-                    - ent_coef * dist_entropy          # adaptive entropy
+                    - ent_coef * dist_entropy
                 ).mean()
 
                 optimizer.zero_grad()
@@ -529,19 +696,22 @@ def train():
                 total_loss += loss.item()
                 n_updates  += 1
 
-        # --- Logging & checkpoint ---
+        # --- Log ---
         if epoch % 5 == 0:
             avg_reward = epoch_reward / STEPS_PER_EPOCH
+            with torch.no_grad():
+                avg_speed = sim.speed.mean().item()
+                best_reward = sim.cumulative_reward.max().item()
             print(
                 f"Epoca {epoch:4d} | "
                 f"Reward: {avg_reward:7.3f} | "
                 f"Std: {cur_std:.3f} | "
                 f"Loss: {total_loss / max(n_updates, 1):.4f} | "
-                f"AvgDist: {metrics['avg_dist']:.2f} | "
-                f"LapCross: {metrics['lap_count']} | "
-                f"GripPct: {metrics['grip_pct']:.1f}% | "
-                f"EntCoef: {ent_coef:.4f} | "
-                f"Spawn: {sim.spawn_fraction:.0%}"
+                f"LatDist: {metrics['avg_lat_dist']:.2f}m | "
+                f"AvgFwd: {metrics['avg_fwd']:.0f}m | "
+                f"Speed: {avg_speed:.1f}km/h | "
+                f"BestR: {best_reward:.1f} | "
+                f"Completed: {metrics['completed']}"
             )
             torch.save({
                 'epoch': epoch,
@@ -551,9 +721,10 @@ def train():
             }, SAVE_PATH)
 
 
-# ---------------------------------------------------------------------------
+# ========================= MAIN =========================
 if __name__ == "__main__":
     mp.freeze_support()
+    print(f"Dispositivo: {DEVICE} | Istanze: {NUM_INSTANCES}")
     try:
         train()
     except KeyboardInterrupt:
