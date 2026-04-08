@@ -55,11 +55,12 @@ def get_data(nome_file):
         
         # Angle calculation: atan2(delta_z, delta_x)
         angle = math.atan2(prev_z - z, x - prev_x)
+        # le uniche informazioni comprovate sono x,y e z
         lista_coordinate.append(Cordinates(x, y, z, dist, row_id, direction, right_bound, left_bound, angle))
     return lista_coordinate
         
 
 if __name__ == "__main__":
-    lista_coordinate = get_data("fast_lane.ai")
+    lista_coordinate = get_data("files_ai/fast_lane.ai")
     for coordinate in lista_coordinate:
         print(coordinate.__str__())
