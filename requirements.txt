@@ -1,0 +1,8 @@
+torch
+numpy
+vgamepad
+gymnasium
+stable-baselines3
+scipy
+pyautogui
+pyaccsharedmemory
