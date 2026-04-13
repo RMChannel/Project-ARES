@@ -1,100 +1,42 @@
 import struct
 import math
-from operator import itemgetter
+from dataclasses import dataclass
 
+@dataclass
+class Coordinates:
+    x: float; y: float; z: float
+    dist: float; id: int; direction: float
+    right_bound: float; left_bound: float; angle: float
 
-class Cordinates:
-    def __init__(self, x, y, z, dist, id, direction, right_bound, left_bound, angle):
-        self.x = x
-        self.y = y
-        self.z = z
-        self.dist = dist
-        self.id = id
-        self.direction = direction
-        self.right_bound = right_bound
-        self.left_bound = left_bound
-        self.angle = angle
-    def __str__(self):
-        return f"({self.x}||{self.y}||{self.z})||{self.direction}||{self.right_bound}||{self.left_bound}||{self.angle}"
+def get_data(file_path):
+    with open(file_path, "rb") as f:
+        _, count, _, _ = struct.unpack("<4i", f.read(16))
+        ideal = [struct.unpack("<4fi", f.read(20)) for _ in range(count)]
+        detail = [struct.unpack("<18f", f.read(72)) for _ in range(count)]
 
-# Initialize accumulators
-def get_data(nome_file):
-    dir_real = 0.0
-    lista_coordinate = []
-    with open(nome_file, "rb") as buffer:
-        # 1. Parse Header
-        # Assuming: magic_number, count, unknown1, unknown2
-        header, detail_count, u1, u2 = struct.unpack("<4i", buffer.read(16))
-
-        # 2. Parse Ideal Data (x, y, z, dist, id)
-        # 4 floats (16 bytes) + 1 int (4 bytes) = 20 bytes per entry
-        data_ideal = [struct.unpack("<4fi", buffer.read(20)) for _ in range(detail_count)]
-
-        # 3. Parse Detail Data (18 floats)
-        # 18 floats (72 bytes) per entry
-        data_detail = [struct.unpack("<18f", buffer.read(72)) for _ in range(detail_count)]
-
-    # 4. Processing Loop
-    for i in range(detail_count):
-        x, y, z, dist, row_id = data_ideal[i]
+    coords = []
+    for i in range(count):
+        x, y, z, dist, row_id = ideal[i]
+        direction, rb, lb = detail[i][4:7]
         
+        px, _, pz, _, _ = ideal[(i - 1) % count]
+        angle = math.atan2(pz - z, x - px)
         
+        coords.append(Coordinates(x, y, z, dist, row_id, direction, rb, lb, angle))
+    return coords
 
-        # Extract specific indices from the 18-float detail block
-        # itemgetter(4, 5, 6) pulls indices 4, 5, and 6
-        direction, right_bound, left_bound = itemgetter(4, 5, 6)(data_detail[i])
+def get3d(file_path, k):
+    coords = get_data(file_path)
+    bounds = []
+    for i in range(len(coords)):
+        p1, p2 = coords[i], coords[(i + 1) % len(coords)]
+        dx, dz = p2.x - p1.x, p2.z - p1.z
+        h = math.sqrt(dx**2 + dz**2)
+        if h == 0: continue
         
-        dir_real += direction   
-        
-        # Calculate angle to previous node (Pathfinding logic)
-        prev_idx = i - 1 if i > 0 else detail_count - 1
-        prev_x, _, prev_z, _, _ = data_ideal[prev_idx]
-        
-        # Angle calculation: atan2(delta_z, delta_x)
-        angle = math.atan2(prev_z - z, x - prev_x)
-        # le uniche informazioni comprovate sono x,y e z
-        lista_coordinate.append(Cordinates(x, y, z, dist, row_id, direction, right_bound, left_bound, angle))
-    return lista_coordinate
-
-
-
-def get3d(file,k):
-    lista_coordinate = get_data(file)
-    n = len(lista_coordinate)
-    lista_coordinate_bordi = []
-    for i in range(n):
-
-
-        a : Cordinates = lista_coordinate[i%n]
-        b : Cordinates = lista_coordinate[i+1%n]
-
-        lista_coordinate_bordi.append(calcola_coordinate_rettangolo(a.x,a.z,b.x,b.z,k))
-
-
-
-
-def calcola_coordinate_rettangolo(x_a, y_a, x_b, y_b, k):
-    dx = x_b - x_a
-    dy = y_b - y_a
-    h = math.sqrt(dx ** 2 + dy ** 2)
-
-    #Questo ci sta
-    if h == 0:
-        return "Errore: A e B non possono coincidere."
-
-    xc = x_a - (k / h) * dy
-    yc = y_a + (k / h) * dx
-
-    xd = x_a + (k / h) * dy
-    yd = y_a - (k / h) * dx
-
-    return {
-        "c": (round(xc, 3), round(yc, 3)),
-        "d": (round(xd, 3), round(yd, 3)),
-    }
-
-
-
-
-if __name__ == "__main__":
-    print("god is not with us")
+        bounds.append({
+            "c":     (p1.x, p1.y, p1.z),
+            "left":  (round(p1.x - (k/h) * dz, 3), p1.y, round(p1.z + (k/h) * dx, 3)),
+            "right": (round(p1.x + (k/h) * dz, 3), p1.y, round(p1.z - (k/h) * dx, 3))
+        })
+    return bounds

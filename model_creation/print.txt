@@ -1,3 +1,0 @@
-Dispositivo rilevato: cuda - Istanze parallele: 512
-Caricamento tracciato da ../files_ai/fast_lane.ai...
-Tracciato caricato: 3166 waypoints.
